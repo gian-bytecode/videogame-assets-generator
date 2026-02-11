@@ -20,7 +20,7 @@ lib/
 # ---------- Pipeline outputs ----------
 output/
 pipeline_output/
-*.zip
+*.tar.zst
 
 # ---------- Temporary / build artifacts ----------
 __pycache__/
@@ -51,8 +51,10 @@ desktop.ini
 .vscode/
 .idea/
 
-# ---------- VPS server secrets (never commit) ----------
+# ---------- VPS server runtime (never commit) ----------
 vps_server/password.hash
+vps_server/build_progress.json
+vps_server/serve/
 vps_server/ssl/
 vps_server/*.pem
 vps_server/*.key

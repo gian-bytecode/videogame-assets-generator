@@ -5,7 +5,8 @@
 ║  WebSocket Secure (WSS) server with bcrypt authentication                  ║
 ║                                                                            ║
 ║  NOT a real SSH server. This is a purpose-built file-distribution daemon    ║
-║  that only serves files and verifies hashes. No shell, no exec, no RCE.    ║
+║  that serves/receives files, verifies hashes, and tracks build progress.   ║
+║  No shell, no exec, no RCE.                                                ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 
 Usage:
@@ -13,9 +14,12 @@ Usage:
     python server.py --config /path/to.yaml   # custom config
 
 Protocol (all JSON over WSS, except binary chunks):
+
+  ── Authentication ──
     → {"action":"auth",     "password":"..."}
     ← {"status":"ok",       "session_id":"..."}
 
+  ── Download (server → client) ──
     → {"action":"manifest", "session_id":"..."}
     ← {"status":"ok",       "files":{"rel/path":{"sha256":"...","size":N}, ...}}
 
@@ -26,6 +30,26 @@ Protocol (all JSON over WSS, except binary chunks):
     ← {"status":"ok",       "path":"...", "sha256":"...", "size":N, "total_chunks":N}
     ← <binary chunk 1>  …  <binary chunk N>
     ← {"status":"transfer_complete", "sha256":"..."}
+
+  ── Upload (client → server) ──
+    → {"action":"upload_begin", "session_id":"...", "path":"rel/path", "sha256":"...", "size":N}
+    ← {"status":"ok",          "ready":true}
+    → <binary chunk 1>  …  <binary chunk N>
+    → {"action":"upload_done",  "session_id":"...", "path":"rel/path", "sha256":"..."}
+    ← {"status":"ok",          "verified":true}
+
+    → {"action":"upload_verify","session_id":"...", "files":{"rel/path":"sha256",...}}
+    ← {"status":"ok",          "to_upload":["rel/path1",...]}
+
+  ── Build Progress ──
+    → {"action":"get_progress",  "session_id":"..."}
+    ← {"status":"ok",           "completed_packages":[...], "total":N}
+
+    → {"action":"mark_package", "session_id":"...", "package_name":"..."}
+    ← {"status":"ok"}
+
+    → {"action":"reset_progress","session_id":"..."}
+    ← {"status":"ok"}
 """
 
 from __future__ import annotations
@@ -70,6 +94,10 @@ SESSIONS: dict[str, float] = {}   # session_id → creation timestamp
 CONFIG: dict[str, Any] = {}
 PASSWORD_HASH: bytes = b""
 FILE_ROOT: Path = Path(".")
+PROGRESS_FILE: Path = Path("build_progress.json")
+
+# Per-connection upload state: ws_id → {path, sha256, size, received, hasher, fh}
+UPLOAD_STATE: dict[int, dict[str, Any]] = {}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -92,7 +120,6 @@ def build_manifest() -> dict[str, dict[str, Any]]:
     """Walk FILE_ROOT and return {relative_path: {sha256, size}} for every file."""
     manifest: dict[str, dict[str, Any]] = {}
     for root, _dirs, files in os.walk(FILE_ROOT):
-        # Skip hidden directories (.git, etc.)
         _dirs[:] = [d for d in _dirs if not d.startswith(".")]
         for fname in files:
             if fname.startswith("."):
@@ -128,27 +155,52 @@ def validate_session(sid: str | None) -> bool:
     return True
 
 
-def safe_resolve(requested: str) -> Path | None:
+def safe_resolve(requested: str, must_exist: bool = True) -> Path | None:
     """
     Resolve a client-requested path, preventing directory traversal.
     Returns the absolute Path if safe, None otherwise.
+    If must_exist=False, the file doesn't need to exist yet (for uploads).
     """
     try:
+        # Reject obvious traversal
+        if ".." in requested.split("/"):
+            return None
         target = (FILE_ROOT / requested).resolve()
-        # Must be under FILE_ROOT
-        if FILE_ROOT.resolve() in target.parents or target == FILE_ROOT.resolve():
-            return None  # it IS the root or something weird
-        if not str(target).startswith(str(FILE_ROOT.resolve())):
-            return None  # traversal attempt
-        if not target.is_file():
+        root_resolved = FILE_ROOT.resolve()
+        if not str(target).startswith(str(root_resolved) + os.sep) and target != root_resolved:
+            return None
+        if target == root_resolved:
+            return None
+        if must_exist and not target.is_file():
             return None
         return target
     except Exception:
         return None
 
 
+# ── Build Progress Persistence ──
+
+def load_progress() -> list[str]:
+    """Load completed package names from disk."""
+    if PROGRESS_FILE.exists():
+        try:
+            data = json.loads(PROGRESS_FILE.read_text("utf-8"))
+            return data.get("completed_packages", [])
+        except (json.JSONDecodeError, OSError):
+            return []
+    return []
+
+
+def save_progress(completed: list[str]) -> None:
+    """Persist completed package names to disk."""
+    PROGRESS_FILE.write_text(
+        json.dumps({"completed_packages": completed}, indent=2),
+        encoding="utf-8",
+    )
+
+
 # ══════════════════════════════════════════════════════════════════════════════
-# Protocol Handlers
+# Protocol Handlers — Authentication
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def handle_auth(ws: Any, data: dict) -> None:
@@ -171,10 +223,13 @@ async def handle_auth(ws: Any, data: dict) -> None:
         await ws.send(json.dumps({"status": "ok", "session_id": session_id}))
     else:
         LOG.warning("❌ Auth FAILED from %s", ws.remote_address)
-        # Brief delay to slow brute-force
         await asyncio.sleep(1)
         await ws.send(json.dumps({"status": "error", "message": "Invalid password"}))
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Protocol Handlers — Download (server → client)
+# ══════════════════════════════════════════════════════════════════════════════
 
 async def handle_manifest(ws: Any, data: dict) -> None:
     if not validate_session(data.get("session_id")):
@@ -223,9 +278,8 @@ async def handle_download(ws: Any, data: dict) -> None:
     file_hash = sha256_file(target)
     total_chunks = (file_size + CHUNK_SIZE - 1) // CHUNK_SIZE
     if total_chunks == 0:
-        total_chunks = 1  # empty file still gets 1 "chunk"
+        total_chunks = 1
 
-    # Send header
     await ws.send(json.dumps({
         "status": "ok",
         "path": requested,
@@ -234,17 +288,13 @@ async def handle_download(ws: Any, data: dict) -> None:
         "total_chunks": total_chunks,
     }))
 
-    # Stream binary chunks
-    sent = 0
     with open(target, "rb") as f:
         while True:
             chunk = f.read(CHUNK_SIZE)
             if not chunk:
                 break
             await ws.send(chunk)
-            sent += len(chunk)
 
-    # Send completion with hash for verification
     await ws.send(json.dumps({
         "status": "transfer_complete",
         "path": requested,
@@ -254,28 +304,221 @@ async def handle_download(ws: Any, data: dict) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Protocol Handlers — Upload (client → server)
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def handle_upload_begin(ws: Any, data: dict) -> None:
+    """Prepare to receive a file from the client."""
+    if not validate_session(data.get("session_id")):
+        await ws.send(json.dumps({"status": "error", "message": "Invalid session"}))
+        return
+
+    rel_path = data.get("path", "")
+    expected_sha = data.get("sha256", "")
+    expected_size = data.get("size", 0)
+
+    if not rel_path or not expected_sha:
+        await ws.send(json.dumps({"status": "error", "message": "path and sha256 required"}))
+        return
+
+    target = safe_resolve(rel_path, must_exist=False)
+    if target is None:
+        await ws.send(json.dumps({
+            "status": "error",
+            "message": f"Invalid path: {rel_path}"
+        }))
+        return
+
+    # Prepare the directory and temp file
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = target.with_suffix(target.suffix + ".tmp")
+
+    fh = open(tmp_path, "wb")
+
+    ws_id = id(ws)
+    UPLOAD_STATE[ws_id] = {
+        "path": rel_path,
+        "target": target,
+        "tmp_path": tmp_path,
+        "expected_sha": expected_sha,
+        "expected_size": expected_size,
+        "received": 0,
+        "hasher": hashlib.sha256(),
+        "fh": fh,
+    }
+
+    LOG.info("📥 Upload begin: %s (%s bytes)", rel_path, f"{expected_size:,}")
+    await ws.send(json.dumps({"status": "ok", "ready": True}))
+
+
+async def handle_upload_chunk(ws: Any, chunk: bytes) -> None:
+    """Handle a binary chunk during an active upload."""
+    ws_id = id(ws)
+    state = UPLOAD_STATE.get(ws_id)
+    if state is None:
+        await ws.send(json.dumps({
+            "status": "error",
+            "message": "No active upload — send upload_begin first"
+        }))
+        return
+
+    state["fh"].write(chunk)
+    state["hasher"].update(chunk)
+    state["received"] += len(chunk)
+
+
+async def handle_upload_done(ws: Any, data: dict) -> None:
+    """Finalize an upload: verify hash, move to final location."""
+    if not validate_session(data.get("session_id")):
+        await ws.send(json.dumps({"status": "error", "message": "Invalid session"}))
+        return
+
+    ws_id = id(ws)
+    state = UPLOAD_STATE.pop(ws_id, None)
+    if state is None:
+        await ws.send(json.dumps({
+            "status": "error",
+            "message": "No active upload to finalize"
+        }))
+        return
+
+    state["fh"].close()
+
+    actual_sha = state["hasher"].hexdigest()
+    expected_sha = data.get("sha256", state["expected_sha"])
+    tmp_path: Path = state["tmp_path"]
+    target: Path = state["target"]
+    rel_path = state["path"]
+
+    if actual_sha != expected_sha:
+        tmp_path.unlink(missing_ok=True)
+        LOG.warning("❌ Upload hash mismatch: %s (expected %s, got %s)",
+                    rel_path, expected_sha[:16], actual_sha[:16])
+        await ws.send(json.dumps({
+            "status": "error",
+            "message": f"Hash mismatch for {rel_path}",
+            "expected": expected_sha,
+            "actual": actual_sha,
+        }))
+        return
+
+    # Atomic replace
+    if target.exists():
+        target.unlink()
+    tmp_path.rename(target)
+
+    LOG.info("📥 Upload OK: %s (%s bytes, sha256:%s…)",
+             rel_path, f"{state['received']:,}", actual_sha[:16])
+    await ws.send(json.dumps({"status": "ok", "verified": True, "path": rel_path}))
+
+
+async def handle_upload_verify(ws: Any, data: dict) -> None:
+    """Client sends its local hashes; server replies with which files need uploading."""
+    if not validate_session(data.get("session_id")):
+        await ws.send(json.dumps({"status": "error", "message": "Invalid session"}))
+        return
+
+    client_files: dict[str, str] = data.get("files", {})
+    server_manifest = build_manifest()
+
+    to_upload: list[str] = []
+    for rel_path, client_hash in client_files.items():
+        server_info = server_manifest.get(rel_path)
+        if server_info is None or server_info["sha256"] != client_hash:
+            to_upload.append(rel_path)
+
+    # Also flag files that client has but server doesn't
+    # (already covered above since server_info would be None)
+
+    LOG.info("🔍 Upload verify: %d/%d files need uploading", len(to_upload), len(client_files))
+    await ws.send(json.dumps({"status": "ok", "to_upload": to_upload}))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Protocol Handlers — Build Progress
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def handle_get_progress(ws: Any, data: dict) -> None:
+    if not validate_session(data.get("session_id")):
+        await ws.send(json.dumps({"status": "error", "message": "Invalid session"}))
+        return
+
+    completed = load_progress()
+    LOG.info("📊 Progress: %d packages completed", len(completed))
+    await ws.send(json.dumps({
+        "status": "ok",
+        "completed_packages": completed,
+        "total": len(completed),
+    }))
+
+
+async def handle_mark_package(ws: Any, data: dict) -> None:
+    if not validate_session(data.get("session_id")):
+        await ws.send(json.dumps({"status": "error", "message": "Invalid session"}))
+        return
+
+    pkg = data.get("package_name", "")
+    if not pkg:
+        await ws.send(json.dumps({"status": "error", "message": "package_name required"}))
+        return
+
+    completed = load_progress()
+    if pkg not in completed:
+        completed.append(pkg)
+        save_progress(completed)
+        LOG.info("✅ Package marked complete: %s (total: %d)", pkg, len(completed))
+    else:
+        LOG.info("ℹ️  Package already marked: %s", pkg)
+
+    await ws.send(json.dumps({"status": "ok", "package_name": pkg}))
+
+
+async def handle_reset_progress(ws: Any, data: dict) -> None:
+    if not validate_session(data.get("session_id")):
+        await ws.send(json.dumps({"status": "error", "message": "Invalid session"}))
+        return
+
+    save_progress([])
+    LOG.info("🔄 Build progress reset")
+    await ws.send(json.dumps({"status": "ok"}))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # WebSocket Handler
 # ══════════════════════════════════════════════════════════════════════════════
 
 HANDLERS = {
     "auth": handle_auth,
+    # Download
     "manifest": handle_manifest,
     "verify": handle_verify,
     "download": handle_download,
+    # Upload
+    "upload_begin": handle_upload_begin,
+    "upload_done": handle_upload_done,
+    "upload_verify": handle_upload_verify,
+    # Progress
+    "get_progress": handle_get_progress,
+    "mark_package": handle_mark_package,
+    "reset_progress": handle_reset_progress,
 }
 
 
 async def connection_handler(ws: Any) -> None:
     peer = ws.remote_address
     LOG.info("🔌 Connection from %s", peer)
+    ws_id = id(ws)
     try:
         async for message in ws:
+            # Binary messages are upload chunks
             if isinstance(message, bytes):
-                # We don't accept binary from clients
-                await ws.send(json.dumps({
-                    "status": "error",
-                    "message": "Binary messages not accepted"
-                }))
+                if ws_id in UPLOAD_STATE:
+                    await handle_upload_chunk(ws, message)
+                else:
+                    await ws.send(json.dumps({
+                        "status": "error",
+                        "message": "Binary received but no active upload"
+                    }))
                 continue
 
             try:
@@ -302,6 +545,18 @@ async def connection_handler(ws: Any) -> None:
         LOG.info("🔌 Connection closed: %s", peer)
     except Exception as exc:
         LOG.exception("💥 Unexpected error from %s: %s", peer, exc)
+    finally:
+        # Cleanup any abandoned upload
+        state = UPLOAD_STATE.pop(ws_id, None)
+        if state:
+            try:
+                state["fh"].close()
+            except Exception:
+                pass
+            tmp_path = state.get("tmp_path")
+            if tmp_path and isinstance(tmp_path, Path):
+                tmp_path.unlink(missing_ok=True)
+            LOG.warning("🗑️  Cleaned up abandoned upload for %s", state.get("path"))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -319,7 +574,7 @@ def load_password_hash(path: str) -> bytes:
 
 
 async def main() -> None:
-    global CONFIG, PASSWORD_HASH, FILE_ROOT
+    global CONFIG, PASSWORD_HASH, FILE_ROOT, PROGRESS_FILE
 
     parser = argparse.ArgumentParser(description="VPS File Server (WSS + bcrypt)")
     parser.add_argument(
@@ -344,15 +599,19 @@ async def main() -> None:
     PASSWORD_HASH = load_password_hash(str(pw_file))
     LOG.info("🔑 Password hash loaded from %s", pw_file)
 
-    # File root (directory to serve)
+    # File root (directory to serve AND receive uploads into)
     FILE_ROOT = Path(CONFIG.get("file_root", "./serve")).resolve()
     if not FILE_ROOT.is_dir():
-        LOG.error("File root directory not found: %s", FILE_ROOT)
-        LOG.error("Create it and place model weights + site_packages inside.")
-        sys.exit(1)
-    LOG.info("📂 Serving files from: %s", FILE_ROOT)
+        FILE_ROOT.mkdir(parents=True, exist_ok=True)
+        LOG.info("📂 Created file root: %s", FILE_ROOT)
+    LOG.info("📂 Serving/receiving files: %s", FILE_ROOT)
 
-    # SSL context
+    # Progress file
+    progress_path = CONFIG.get("progress_file", "build_progress.json")
+    PROGRESS_FILE = Path(progress_path)
+    LOG.info("📊 Progress file: %s", PROGRESS_FILE)
+
+    # SSL context (required for WSS)
     ssl_ctx: ssl.SSLContext | None = None
     ssl_cert = CONFIG.get("ssl_cert")
     ssl_key = CONFIG.get("ssl_key")
@@ -373,7 +632,7 @@ async def main() -> None:
     SESSION_TTL = CONFIG.get("session_ttl", SESSION_TTL)
     MAX_SESSIONS = CONFIG.get("max_sessions", MAX_SESSIONS)
 
-    # Max message size — client messages are small JSON, but set a sane limit
+    # Max message size — must accommodate upload chunks
     max_msg_size = CONFIG.get("max_message_size", 10 * 1024 * 1024)  # 10 MiB
 
     LOG.info("🚀 Starting server on %s:%d …", host, port)
