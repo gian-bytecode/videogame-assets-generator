@@ -274,76 +274,97 @@ class VPSClient:
             raise RuntimeError(f"Verify error: {resp.get('message')}")
         return resp["to_download"]
 
-    def download_file(self, remote_path: str, local_path: Path) -> bool:
+    def download_zip(self, paths: list[str], workspace: Path) -> tuple[int, int]:
         """
-        Download a single file. Returns True if hash matches, False otherwise.
+        Ask the server to build a ZIP_STORED archive of the given paths,
+        download it as a single stream, and extract locally.
+        Returns (extracted_count, failed_count).
         """
         self.ws.send(json.dumps({
-            "action": "download",
+            "action": "download_zip",
             "session_id": self.session_id,
-            "path": remote_path,
+            "paths": paths,
         }))
 
         # Receive header
         header = json.loads(self.ws.recv())
         if header.get("status") != "ok":
-            print(f"    ❌ Server error for {remote_path}: {header.get('message')}")
-            return False
+            print(f"    ❌ Server error: {header.get('message')}")
+            return 0, len(paths)
 
         expected_hash = header["sha256"]
         expected_size = header["size"]
-        total_chunks = header["total_chunks"]
+        file_count = header.get("file_count", len(paths))
 
-        # Prepare local file
-        local_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = local_path.with_suffix(local_path.suffix + ".tmp")
+        print(f"  📥 Downloading zip: {file_count} files, {expected_size / (1024**2):.1f} MiB")
 
-        received = 0
-        chunk_n = 0
+        # Stream to temp file with progress
+        tmp_path = workspace / ".download_tmp.zip"
         hasher = hashlib.sha256()
+        received = 0
+        t0 = time.time()
 
         with open(tmp_path, "wb") as f:
-            for _ in range(total_chunks):
+            while received < expected_size:
                 data = self.ws.recv()
                 if isinstance(data, str):
-                    # Unexpected JSON (error?)
+                    # Could be an error or early completion
                     msg = json.loads(data)
                     if msg.get("status") == "error":
                         print(f"    ❌ Error during transfer: {msg.get('message')}")
                         tmp_path.unlink(missing_ok=True)
-                        return False
+                        return 0, len(paths)
                     break
                 f.write(data)
                 hasher.update(data)
                 received += len(data)
-                chunk_n += 1
-
-                # Progress for large files (> 10 MiB)
-                if expected_size > 10 * 1024 * 1024 and chunk_n % 50 == 0:
-                    pct = (received / expected_size) * 100
-                    print(f"    … {remote_path}: {pct:.0f}%", end="\r")
+                elapsed = time.time() - t0
+                speed = received / (1024**2) / max(elapsed, 0.001)
+                pct = received / expected_size * 100
+                print(
+                    f"\r  📥 {received / (1024**2):.1f}/{expected_size / (1024**2):.1f} MiB"
+                    f" ({pct:.0f}%) — {speed:.1f} MiB/s",
+                    end="", flush=True,
+                )
+        print()  # newline after progress
 
         # Receive completion message
         completion = json.loads(self.ws.recv())
         if completion.get("status") != "transfer_complete":
-            print(f"    ⚠️  Unexpected completion for {remote_path}")
+            print(f"    ⚠️  Unexpected completion message")
             tmp_path.unlink(missing_ok=True)
-            return False
+            return 0, len(paths)
 
         # Verify hash
         actual_hash = hasher.hexdigest()
         if actual_hash != expected_hash:
-            print(f"    ❌ Hash mismatch for {remote_path}!")
-            print(f"       Expected: {expected_hash}")
-            print(f"       Got:      {actual_hash}")
+            print(f"    ❌ Zip hash mismatch!")
             tmp_path.unlink(missing_ok=True)
-            return False
+            return 0, len(paths)
 
-        # Atomic rename
-        if local_path.exists():
-            local_path.unlink()
-        tmp_path.rename(local_path)
-        return True
+        # Extract
+        print(f"  📦 Extracting …", end=" ", flush=True)
+        extracted = 0
+        try:
+            import zipfile
+            with zipfile.ZipFile(tmp_path, "r") as zf:
+                for info in zf.infolist():
+                    if info.is_dir():
+                        continue
+                    target = workspace / info.filename
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    with zf.open(info) as src, open(target, "wb") as dst:
+                        import shutil
+                        shutil.copyfileobj(src, dst)
+                    extracted += 1
+            print(f"{extracted} files")
+        except Exception as exc:
+            print(f"❌ Extraction error: {exc}")
+            return 0, len(paths)
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
+        return extracted, 0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -396,28 +417,11 @@ def vps_sync(vps_url: str, password: str, workspace: Path) -> None:
         print(f"  📥 Need to download: {len(to_download)} files ({dl_size / (1024**3):.2f} GiB)")
         print()
 
-        # Download each file
-        success = 0
-        failed = 0
-        for i, rel_path in enumerate(to_download, 1):
-            local_file = workspace / rel_path
-            size_mb = manifest[rel_path]["size"] / (1024**2)
-            print(f"  [{i}/{len(to_download)}] {rel_path} ({size_mb:.1f} MiB) …", end=" ")
-
-            t0 = time.time()
-            ok = client.download_file(rel_path, local_file)
-            elapsed = time.time() - t0
-
-            if ok:
-                speed = (manifest[rel_path]["size"] / (1024**2)) / max(elapsed, 0.001)
-                print(f"✅ ({elapsed:.1f}s, {speed:.1f} MiB/s)")
-                success += 1
-            else:
-                print("❌ FAILED")
-                failed += 1
+        # Download as a single zip archive
+        extracted, failed = client.download_zip(to_download, workspace)
 
         print()
-        print(f"  ✅ Download complete: {success} OK, {failed} failed")
+        print(f"  ✅ Download complete: {extracted} extracted, {failed} failed")
         if failed:
             print(f"  ⚠️  {failed} files failed — re-run the bootstrap to retry.")
 
@@ -430,12 +434,13 @@ def vps_sync(vps_url: str, password: str, workspace: Path) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def post_sync_setup(workspace: Path) -> None:
-    """Add site_packages to Python path so imports work."""
+    """Add site_packages to Python path, clone TRELLIS repo."""
     print()
     print("═" * 60)
     print("  ⚙️  STEP 3 — Post-sync setup")
     print("═" * 60)
 
+    # ── 1. Add site_packages to path ──
     sp_dir = workspace / SITE_PACKAGES_DIR
     if sp_dir.is_dir():
         sp_str = str(sp_dir)
@@ -453,6 +458,44 @@ def post_sync_setup(workspace: Path) -> None:
     else:
         print(f"  ⚠️  {MODELS_DIR}/ not found — model weights may not be available")
 
+    # ── 2. Clone/update TRELLIS (not a pip package) ──
+    trellis_dir = workspace / "TRELLIS"
+    if trellis_dir.is_dir():
+        print(f"  🔄 Updating TRELLIS repo …")
+        try:
+            subprocess.run(
+                ["git", "pull"],
+                cwd=trellis_dir,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            print(f"  ✅ TRELLIS repo updated")
+        except subprocess.CalledProcessError:
+            print(f"  ⚠️  TRELLIS git pull failed — will use existing version")
+    else:
+        print(f"  📥 Cloning TRELLIS repo …")
+        try:
+            subprocess.run(
+                ["git", "clone", "https://github.com/microsoft/TRELLIS.git", str(trellis_dir)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            print(f"  ✅ TRELLIS repo cloned")
+        except subprocess.CalledProcessError as exc:
+            print(f"  ❌ TRELLIS clone failed: {exc}")
+            print(f"     You may need to clone it manually.")
+
+    # Add TRELLIS to sys.path
+    if trellis_dir.is_dir():
+        trellis_str = str(trellis_dir)
+        if trellis_str not in sys.path:
+            sys.path.insert(0, trellis_str)
+            print(f"  ✅ Added TRELLIS/ to sys.path")
+        else:
+            print(f"  ✅ TRELLIS/ already in sys.path")
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Final summary & validation
@@ -467,6 +510,7 @@ def final_summary(workspace: Path) -> None:
 
     dirs_to_check = [
         ("Code (from GitHub)", workspace, [".py", ".json", ".md", ".txt", ".yaml"]),
+        ("TRELLIS repo",       workspace / "TRELLIS", [".py"]),
         ("Model weights",      workspace / MODELS_DIR, None),
         ("Site packages",      workspace / SITE_PACKAGES_DIR, None),
     ]

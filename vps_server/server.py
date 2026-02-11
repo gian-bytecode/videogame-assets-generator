@@ -19,15 +19,15 @@ Protocol (all JSON over WSS, except binary chunks):
     → {"action":"auth",     "password":"..."}
     ← {"status":"ok",       "session_id":"..."}
 
-  ── Download (server → client) ──
+  ── Download (server → client, zip-based) ──
     → {"action":"manifest", "session_id":"..."}
     ← {"status":"ok",       "files":{"rel/path":{"sha256":"...","size":N}, ...}}
 
     → {"action":"verify",   "session_id":"...", "files":{"rel/path":"sha256",...}}
     ← {"status":"ok",       "to_download":["rel/path1","rel/path2",...]}
 
-    → {"action":"download", "session_id":"...", "path":"rel/path"}
-    ← {"status":"ok",       "path":"...", "sha256":"...", "size":N, "total_chunks":N}
+    → {"action":"download_zip", "session_id":"...", "paths":["rel/path1",...]}
+    ← {"status":"ok",          "sha256":"...", "size":N}
     ← <binary chunk 1>  …  <binary chunk N>
     ← {"status":"transfer_complete", "sha256":"..."}
 
@@ -102,8 +102,9 @@ PROGRESS_FILE: Path = Path("build_progress.json")
 # Per-connection upload state: ws_id → {path, sha256, size, received, hasher, fh}
 UPLOAD_STATE: dict[int, dict[str, Any]] = {}
 
-# Thread pool for blocking I/O (zip extraction) so the event loop stays alive
-_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+# Thread pool for blocking I/O (file hashing, zip extraction, manifest building)
+# Must have enough workers to handle concurrent requests without blocking the event loop
+_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=8)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -282,48 +283,82 @@ async def handle_verify(ws: Any, data: dict) -> None:
     await ws.send(json.dumps({"status": "ok", "to_download": to_download}))
 
 
-async def handle_download(ws: Any, data: dict) -> None:
+async def handle_download_zip(ws: Any, data: dict) -> None:
+    """Build a ZIP_STORED archive of requested paths and stream it to the client."""
     if not validate_session(data.get("session_id")):
         await ws.send(json.dumps({"status": "error", "message": "Invalid session"}))
         return
 
-    requested = data.get("path", "")
-    target = safe_resolve(requested)
-    if target is None:
+    paths: list[str] = data.get("paths", [])
+    if not paths:
+        await ws.send(json.dumps({"status": "error", "message": "paths list required"}))
+        return
+
+    # Resolve and validate all paths upfront
+    resolved: list[tuple[str, Path]] = []
+    for rel in paths:
+        target = safe_resolve(rel)
+        if target is not None:
+            resolved.append((rel, target))
+
+    if not resolved:
         await ws.send(json.dumps({
             "status": "error",
-            "message": f"File not found or access denied: {requested}"
+            "message": "No valid files found in the requested paths"
         }))
         return
 
-    file_size = target.stat().st_size
+    # Build the zip in a thread (blocking I/O)
     loop = asyncio.get_running_loop()
-    file_hash = await loop.run_in_executor(_EXECUTOR, sha256_file, target)
-    total_chunks = (file_size + CHUNK_SIZE - 1) // CHUNK_SIZE
-    if total_chunks == 0:
-        total_chunks = 1
+    tmp_path = FILE_ROOT / f".download_{secrets.token_hex(8)}.zip"
+    try:
+        zip_hash, zip_size = await loop.run_in_executor(
+            _EXECUTOR,
+            _build_download_zip_blocking,
+            resolved,
+            tmp_path,
+        )
+    except Exception as exc:
+        tmp_path.unlink(missing_ok=True)
+        LOG.exception("❌ Failed to build download zip: %s", exc)
+        await ws.send(json.dumps({"status": "error", "message": f"Zip build error: {exc}"}))
+        return
 
+    # Send header
     await ws.send(json.dumps({
         "status": "ok",
-        "path": requested,
-        "sha256": file_hash,
-        "size": file_size,
-        "total_chunks": total_chunks,
+        "sha256": zip_hash,
+        "size": zip_size,
+        "file_count": len(resolved),
     }))
 
-    with open(target, "rb") as f:
-        while True:
-            chunk = f.read(CHUNK_SIZE)
-            if not chunk:
-                break
-            await ws.send(chunk)
+    # Stream the zip file in chunks
+    try:
+        with open(tmp_path, "rb") as f:
+            while True:
+                chunk = f.read(CHUNK_SIZE)
+                if not chunk:
+                    break
+                await ws.send(chunk)
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
     await ws.send(json.dumps({
         "status": "transfer_complete",
-        "path": requested,
-        "sha256": file_hash,
+        "sha256": zip_hash,
     }))
-    LOG.info("📤 Sent %s (%s bytes, %d chunks)", requested, f"{file_size:,}", total_chunks)
+    LOG.info("📤 Sent download zip: %d files, %s bytes", len(resolved), f"{zip_size:,}")
+
+
+def _build_download_zip_blocking(
+    files: list[tuple[str, Path]], dest: Path
+) -> tuple[str, int]:
+    """Create a ZIP_STORED archive from resolved files. Returns (sha256, size)."""
+    with zipfile.ZipFile(dest, "w", zipfile.ZIP_STORED) as zf:
+        for rel, full in files:
+            zf.write(str(full), arcname=rel)
+    h = sha256_file(dest)
+    return h, dest.stat().st_size
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -550,7 +585,7 @@ HANDLERS = {
     # Download
     "manifest": handle_manifest,
     "verify": handle_verify,
-    "download": handle_download,
+    "download_zip": handle_download_zip,
     # Upload
     "upload_zip_begin": handle_upload_zip_begin,
     "upload_zip_done": handle_upload_zip_done,

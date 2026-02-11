@@ -31,8 +31,9 @@ plyfile
 pygltflib
 imageio
 
-# TRELLIS va installato da git:
-#   pip install git+https://github.com/microsoft/TRELLIS.git
+# TRELLIS non è un pacchetto pip — va clonato manualmente come repository:
+#   git clone https://github.com/microsoft/TRELLIS.git
+#   Poi aggiungere la directory al PYTHONPATH
 
 # ---------- StableNormal ----------
 # Installazione da git:

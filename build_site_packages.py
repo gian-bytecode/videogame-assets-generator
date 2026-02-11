@@ -54,8 +54,9 @@ PACKAGES: list[dict] = [
     {"name": "xatlas",              "pip": "xatlas"},
     {"name": "plyfile",             "pip": "plyfile"},
     {"name": "imageio",             "pip": "imageio"},
-    # ── 3. TRELLIS (git) ──
-    {"name": "trellis",             "pip": "git+https://github.com/microsoft/TRELLIS.git"},
+    # ── 3. TRELLIS ──
+    # TRELLIS non è un pacchetto pip — va clonato manualmente:
+    #   git clone https://github.com/microsoft/TRELLIS.git
     # ── 4. StableNormal (git) ──
     {"name": "stablenormal",        "pip": "git+https://github.com/Stable-X/StableNormal.git"},
     # ── 5. torch-geometric + extensions ──
