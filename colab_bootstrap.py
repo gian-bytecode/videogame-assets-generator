@@ -49,6 +49,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -89,14 +91,16 @@ def sha256_file(path: Path) -> str:
 def hash_directory(root: Path, skip_dirs: set[str] | None = None) -> dict[str, str]:
     """
     Walk a directory and return {relative_posix_path: sha256} for every file.
+    Hashing is parallelised across CPU cores.
     Skips hidden dirs/files and any directory names in skip_dirs.
     """
     skip = skip_dirs or set()
-    result: dict[str, str] = {}
     if not root.is_dir():
-        return result
+        return {}
+
+    # Collect files first (fast single-threaded walk)
+    file_list: list[tuple[str, Path]] = []
     for dirpath, dirnames, filenames in os.walk(root):
-        # Prune hidden & skipped dirs IN PLACE
         dirnames[:] = [
             d for d in dirnames
             if not d.startswith(".") and d not in skip
@@ -106,8 +110,20 @@ def hash_directory(root: Path, skip_dirs: set[str] | None = None) -> dict[str, s
                 continue
             full = Path(dirpath) / fname
             rel = full.relative_to(root).as_posix()
+            file_list.append((rel, full))
+
+    # Hash in parallel
+    result: dict[str, str] = {}
+    workers = min(os.cpu_count() or 4, 8)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(sha256_file, full): rel
+            for rel, full in file_list
+        }
+        for fut in as_completed(futures):
+            rel = futures[fut]
             try:
-                result[rel] = sha256_file(full)
+                result[rel] = fut.result()
             except OSError:
                 pass
     return result
@@ -228,7 +244,11 @@ class VPSClient:
             ssl_context=ssl_ctx,
             max_size=50 * 1024 * 1024,  # 50 MiB max frame
             open_timeout=30,
-            close_timeout=10,
+            close_timeout=30,
+            # Keep connection alive during long server-side operations
+            # (manifest build, zip creation)
+            ping_interval=20,
+            ping_timeout=120,
         )
 
         # Authenticate
@@ -274,12 +294,67 @@ class VPSClient:
             raise RuntimeError(f"Verify error: {resp.get('message')}")
         return resp["to_download"]
 
-    def download_zip(self, paths: list[str], workspace: Path) -> tuple[int, int]:
+    # ── Batch size for zip downloads (avoid building one giant zip) ──
+    DOWNLOAD_BATCH_MIB = 500  # ~500 MiB per zip batch
+
+    def download_zip(self, paths: list[str], workspace: Path,
+                     manifest: dict[str, dict[str, Any]]) -> tuple[int, int]:
         """
-        Ask the server to build a ZIP_STORED archive of the given paths,
-        download it as a single stream, and extract locally.
-        Returns (extracted_count, failed_count).
+        Download files from VPS in batches of ~DOWNLOAD_BATCH_MIB.
+        Each batch: server builds ZIP_STORED → streams it → client extracts.
+        Returns (total_extracted, total_failed).
         """
+        # Split paths into size-limited batches
+        batches: list[list[str]] = []
+        current_batch: list[str] = []
+        current_size = 0
+        batch_limit = self.DOWNLOAD_BATCH_MIB * 1024 * 1024
+
+        for p in paths:
+            fsize = manifest.get(p, {}).get("size", 0)
+            if current_batch and (current_size + fsize) > batch_limit:
+                batches.append(current_batch)
+                current_batch = []
+                current_size = 0
+            current_batch.append(p)
+            current_size += fsize
+        if current_batch:
+            batches.append(current_batch)
+
+        total_extracted = 0
+        total_failed = 0
+
+        for batch_idx, batch in enumerate(batches, 1):
+            batch_size = sum(manifest.get(p, {}).get("size", 0) for p in batch)
+            print(f"\n  📦 Batch {batch_idx}/{len(batches)}: {len(batch)} files, "
+                  f"{batch_size / (1024**2):.0f} MiB")
+
+            extracted, failed = self._download_one_batch(batch, workspace)
+            total_extracted += extracted
+            total_failed += failed
+
+            if failed:
+                print(f"  ⚠️  Batch {batch_idx} had {failed} failures — continuing")
+
+        return total_extracted, total_failed
+
+    def _download_one_batch(self, paths: list[str], workspace: Path,
+                            max_retries: int = 2) -> tuple[int, int]:
+        """Download one batch with retry on failure."""
+        for attempt in range(1, max_retries + 1):
+            try:
+                return self._download_batch_inner(paths, workspace)
+            except Exception as exc:
+                if attempt < max_retries:
+                    print(f"  ⚠️  Batch attempt {attempt} failed: {exc} — retrying …")
+                    time.sleep(2)
+                else:
+                    print(f"  ❌ Batch failed after {max_retries} attempts: {exc}")
+                    return 0, len(paths)
+        return 0, len(paths)  # unreachable, but satisfies type checker
+
+    def _download_batch_inner(self, paths: list[str], workspace: Path) -> tuple[int, int]:
+        """Core logic for downloading one zip batch."""
         self.ws.send(json.dumps({
             "action": "download_zip",
             "session_id": self.session_id,
@@ -296,8 +371,6 @@ class VPSClient:
         expected_size = header["size"]
         file_count = header.get("file_count", len(paths))
 
-        print(f"  📥 Downloading zip: {file_count} files, {expected_size / (1024**2):.1f} MiB")
-
         # Stream to temp file with progress
         tmp_path = workspace / ".download_tmp.zip"
         hasher = hashlib.sha256()
@@ -308,12 +381,14 @@ class VPSClient:
             while received < expected_size:
                 data = self.ws.recv()
                 if isinstance(data, str):
-                    # Could be an error or early completion
                     msg = json.loads(data)
                     if msg.get("status") == "error":
-                        print(f"    ❌ Error during transfer: {msg.get('message')}")
+                        print(f"\n    ❌ Transfer error: {msg.get('message')}")
                         tmp_path.unlink(missing_ok=True)
                         return 0, len(paths)
+                    # Could be transfer_complete arriving early (empty zip edge case)
+                    if msg.get("status") == "transfer_complete":
+                        break
                     break
                 f.write(data)
                 hasher.update(data)
@@ -322,18 +397,20 @@ class VPSClient:
                 speed = received / (1024**2) / max(elapsed, 0.001)
                 pct = received / expected_size * 100
                 print(
-                    f"\r  📥 {received / (1024**2):.1f}/{expected_size / (1024**2):.1f} MiB"
+                    f"\r    📥 {received / (1024**2):.1f}/{expected_size / (1024**2):.1f} MiB"
                     f" ({pct:.0f}%) — {speed:.1f} MiB/s",
                     end="", flush=True,
                 )
-        print()  # newline after progress
+        print()  # newline
 
-        # Receive completion message
-        completion = json.loads(self.ws.recv())
-        if completion.get("status") != "transfer_complete":
-            print(f"    ⚠️  Unexpected completion message")
-            tmp_path.unlink(missing_ok=True)
-            return 0, len(paths)
+        # If we broke out of the loop due to JSON, we already have completion
+        # Otherwise receive it
+        if received >= expected_size:
+            completion = json.loads(self.ws.recv())
+            if completion.get("status") != "transfer_complete":
+                print(f"    ⚠️  Unexpected completion: {completion}")
+                tmp_path.unlink(missing_ok=True)
+                return 0, len(paths)
 
         # Verify hash
         actual_hash = hasher.hexdigest()
@@ -343,10 +420,9 @@ class VPSClient:
             return 0, len(paths)
 
         # Extract
-        print(f"  📦 Extracting …", end=" ", flush=True)
+        print(f"    📦 Extracting …", end=" ", flush=True)
         extracted = 0
         try:
-            import zipfile
             with zipfile.ZipFile(tmp_path, "r") as zf:
                 for info in zf.infolist():
                     if info.is_dir():
@@ -354,7 +430,6 @@ class VPSClient:
                     target = workspace / info.filename
                     target.parent.mkdir(parents=True, exist_ok=True)
                     with zf.open(info) as src, open(target, "wb") as dst:
-                        import shutil
                         shutil.copyfileobj(src, dst)
                     extracted += 1
             print(f"{extracted} files")
@@ -396,10 +471,25 @@ def vps_sync(vps_url: str, password: str, workspace: Path) -> None:
         # VPS serves models_cache/ and site_packages/ — both live under workspace
         print("  🔍 Hashing local files for comparison …")
         local_hashes: dict[str, str] = {}
+        existing_files: list[tuple[str, Path]] = []
         for rel_path in manifest:
             local_file = workspace / rel_path
             if local_file.is_file():
-                local_hashes[rel_path] = sha256_file(local_file)
+                existing_files.append((rel_path, local_file))
+
+        if existing_files:
+            workers = min(os.cpu_count() or 4, 8)
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {
+                    pool.submit(sha256_file, full): rel
+                    for rel, full in existing_files
+                }
+                for fut in as_completed(futures):
+                    rel = futures[fut]
+                    try:
+                        local_hashes[rel] = fut.result()
+                    except OSError:
+                        pass
 
         existing = len(local_hashes)
         print(f"  🔍 Found {existing}/{total_files} files locally")
@@ -417,8 +507,8 @@ def vps_sync(vps_url: str, password: str, workspace: Path) -> None:
         print(f"  📥 Need to download: {len(to_download)} files ({dl_size / (1024**3):.2f} GiB)")
         print()
 
-        # Download as a single zip archive
-        extracted, failed = client.download_zip(to_download, workspace)
+        # Download in batches of ~500 MiB
+        extracted, failed = client.download_zip(to_download, workspace, manifest)
 
         print()
         print(f"  ✅ Download complete: {extracted} extracted, {failed} failed")

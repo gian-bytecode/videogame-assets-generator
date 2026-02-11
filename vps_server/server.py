@@ -102,6 +102,11 @@ PROGRESS_FILE: Path = Path("build_progress.json")
 # Per-connection upload state: ws_id → {path, sha256, size, received, hasher, fh}
 UPLOAD_STATE: dict[int, dict[str, Any]] = {}
 
+# Manifest cache: avoids re-hashing when verify follows manifest in the same session
+# {"data": manifest_dict, "time": timestamp}
+_MANIFEST_CACHE: dict[str, Any] = {"data": None, "time": 0.0}
+_MANIFEST_CACHE_TTL = 60  # seconds — fresh enough for verify right after manifest
+
 # Thread pool for blocking I/O (file hashing, zip extraction, manifest building)
 # Must have enough workers to handle concurrent requests without blocking the event loop
 _EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=8)
@@ -252,14 +257,25 @@ async def handle_auth(ws: Any, data: dict) -> None:
 # Protocol Handlers — Download (server → client)
 # ══════════════════════════════════════════════════════════════════════════════
 
+async def _get_manifest_cached() -> dict[str, dict[str, Any]]:
+    """Return manifest from cache if fresh, otherwise rebuild in thread."""
+    now = time.time()
+    if _MANIFEST_CACHE["data"] is not None and (now - _MANIFEST_CACHE["time"]) < _MANIFEST_CACHE_TTL:
+        return _MANIFEST_CACHE["data"]
+    loop = asyncio.get_running_loop()
+    manifest = await loop.run_in_executor(_EXECUTOR, build_manifest)
+    _MANIFEST_CACHE["data"] = manifest
+    _MANIFEST_CACHE["time"] = time.time()
+    return manifest
+
+
 async def handle_manifest(ws: Any, data: dict) -> None:
     if not validate_session(data.get("session_id")):
         await ws.send(json.dumps({"status": "error", "message": "Invalid session"}))
         return
 
     LOG.info("📋 Building manifest …")
-    loop = asyncio.get_running_loop()
-    manifest = await loop.run_in_executor(_EXECUTOR, build_manifest)
+    manifest = await _get_manifest_cached()
     LOG.info("📋 Manifest: %d files", len(manifest))
     await ws.send(json.dumps({"status": "ok", "files": manifest}))
 
@@ -270,16 +286,15 @@ async def handle_verify(ws: Any, data: dict) -> None:
         return
 
     client_files: dict[str, str] = data.get("files", {})
-    loop = asyncio.get_running_loop()
-    server_manifest = await loop.run_in_executor(_EXECUTOR, build_manifest)
+    manifest = await _get_manifest_cached()
 
     to_download: list[str] = []
-    for rel_path, info in server_manifest.items():
+    for rel_path, info in manifest.items():
         client_hash = client_files.get(rel_path)
         if client_hash != info["sha256"]:
             to_download.append(rel_path)
 
-    LOG.info("🔍 Verify: %d/%d files need update", len(to_download), len(server_manifest))
+    LOG.info("🔍 Verify: %d/%d files need update", len(to_download), len(manifest))
     await ws.send(json.dumps({"status": "ok", "to_download": to_download}))
 
 
@@ -468,6 +483,9 @@ async def handle_upload_zip_done(ws: Any, data: dict) -> None:
         await ws.send(json.dumps({"status": "error", "message": f"Extraction error: {exc}"}))
         return
 
+    # Invalidate manifest cache since files changed
+    _MANIFEST_CACHE["data"] = None
+
     LOG.info("📥 Zip extracted: %d files (%s bytes, sha256:%s…)",
              extracted, f"{state['received']:,}", actual_sha[:16])
     await ws.send(json.dumps({
@@ -511,12 +529,11 @@ async def handle_upload_verify(ws: Any, data: dict) -> None:
         return
 
     client_files: dict[str, str] = data.get("files", {})
-    loop = asyncio.get_running_loop()
-    server_manifest = await loop.run_in_executor(_EXECUTOR, build_manifest)
+    manifest = await _get_manifest_cached()
 
     to_upload: list[str] = []
     for rel_path, client_hash in client_files.items():
-        server_info = server_manifest.get(rel_path)
+        server_info = manifest.get(rel_path)
         if server_info is None or server_info["sha256"] != client_hash:
             to_upload.append(rel_path)
 
@@ -525,6 +542,8 @@ async def handle_upload_verify(ws: Any, data: dict) -> None:
 
     LOG.info("🔍 Upload verify: %d/%d files need uploading", len(to_upload), len(client_files))
     await ws.send(json.dumps({"status": "ok", "to_upload": to_upload}))
+    # Invalidate cache after upload so next manifest/verify sees new files
+    _MANIFEST_CACHE["data"] = None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -736,8 +755,8 @@ async def main() -> None:
         port,
         ssl=ssl_ctx,
         max_size=max_msg_size,
-        ping_interval=30,
-        ping_timeout=60,
+        ping_interval=20,
+        ping_timeout=120,
     ):
         LOG.info("✅ Server ready. Ctrl+C to stop.")
         await asyncio.Future()  # run forever
