@@ -1,0 +1,37 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# VPS File Server — Configuration
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ---------- Network ----------
+host: "0.0.0.0"
+port: 9999
+
+# ---------- SSL / TLS ----------
+# For production, use Let's Encrypt or your own certs.
+# Uncomment and set paths:
+# ssl_cert: "/etc/letsencrypt/live/yourdomain.com/fullchain.pem"
+# ssl_key:  "/etc/letsencrypt/live/yourdomain.com/privkey.pem"
+
+# ---------- Authentication ----------
+password_hash_file: "password.hash"
+
+# ---------- File serving ----------
+# Root directory containing all files to serve (model weights + site_packages).
+# Structure example:
+#   serve/
+#   ├── models_cache/
+#   │   ├── trellis/
+#   │   ├── stable-normal/
+#   │   ├── sdxl/
+#   │   └── ...
+#   └── site_packages/
+#       └── ... (pip --target output)
+file_root: "./serve"
+
+# ---------- Transfer ----------
+chunk_size: 1048576        # 1 MiB per WebSocket frame
+max_message_size: 10485760 # 10 MiB max incoming message
+
+# ---------- Sessions ----------
+session_ttl: 3600    # seconds (1 hour)
+max_sessions: 2     # max concurrent authenticated sessions

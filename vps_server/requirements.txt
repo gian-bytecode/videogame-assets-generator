@@ -1,0 +1,4 @@
+# VPS File Server — Python requirements
+websockets>=12.0
+bcrypt>=4.0
+pyyaml>=6.0

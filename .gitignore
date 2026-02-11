@@ -1,0 +1,61 @@
+# ============================================================================
+# Videogame Assets Generator — .gitignore
+# ============================================================================
+
+# ---------- Model Weights (downloaded from VPS) ----------
+models_cache/
+weights/
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.ckpt
+*.onnx
+*.h5
+
+# ---------- Python site-packages (installed with --target on Colab) ----------
+site_packages/
+lib/
+
+# ---------- Pipeline outputs ----------
+output/
+pipeline_output/
+*.zip
+
+# ---------- Temporary / build artifacts ----------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ---------- Colab / Jupyter ----------
+.ipynb_checkpoints/
+*.ipynb
+
+# ---------- Environment ----------
+.env
+.venv/
+venv/
+env/
+
+# ---------- OS ----------
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---------- IDE ----------
+.vscode/
+.idea/
+
+# ---------- VPS server secrets (never commit) ----------
+vps_server/password.hash
+vps_server/ssl/
+vps_server/*.pem
+vps_server/*.key
+vps_server/*.crt
+
+sample_input/

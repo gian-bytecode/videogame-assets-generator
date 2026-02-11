@@ -1,0 +1,64 @@
+# ============================================================================
+# Videogame Assets Generator — Requirements
+# ============================================================================
+# Install:  pip install -r requirements.txt
+#
+# NOTE: torch con CUDA 12.1 va installato PRIMA (o usa il flag --extra-index-url):
+#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+#
+# Su Google Colab / Kaggle, torch+CUDA è già preinstallato.
+# ============================================================================
+
+# ---------- Core ML ----------
+torch
+torchvision
+torchaudio
+transformers
+diffusers
+accelerate
+safetensors
+huggingface_hub
+
+# ---------- TRELLIS (3D Generation) ----------
+# kaolin necessita di installazione separata con il flag -f:
+#   pip install kaolin -f https://nvidia-kaolin.s3.us-east-2.amazonaws.com/torch-2.1.0_cu121.html
+nvdiffrast
+xatlas
+plyfile
+imageio
+
+# TRELLIS va installato da git:
+#   pip install git+https://github.com/microsoft/TRELLIS.git
+
+# ---------- StableNormal ----------
+# Installazione da git:
+#   pip install git+https://github.com/Stable-X/StableNormal.git
+
+# ---------- RigNet (Rigging) ----------
+# torch-geometric e i suoi ext necessitano del flag -f:
+#   pip install torch-geometric torch-scatter torch-sparse torch-cluster torch-spline-conv -f https://data.pyg.org/whl/torch-2.1.0+cu121.html
+networkx
+rtree
+
+# ---------- Fish Speech (TTS + Voice Cloning) ----------
+fish-speech
+
+# ---------- AudioCraft (Sound FX) ----------
+audiocraft
+
+# ---------- Quantization ----------
+bitsandbytes
+optimum-quanto
+
+# ---------- 3D / Mesh ----------
+trimesh
+pymeshlab
+open3d
+opencv-python-headless
+
+# ---------- General Utilities ----------
+numpy
+scipy
+Pillow
+tqdm
+soundfile

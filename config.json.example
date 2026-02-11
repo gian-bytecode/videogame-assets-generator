@@ -1,0 +1,215 @@
+{
+    "_README": "=== VIDEOGAME ASSETS GENERATOR — config.json REFERENCE ===",
+    "_README2": "Ogni sezione è INDIPENDENTE dalle altre. Puoi usarne una, alcune, o tutte. Rimuovi i campi _comment prima dell'uso.",
+
+
+    "models_3d": {
+        "_comment": "Modelli 3D da generare. Ogni entry produce mesh (.obj) + opzionalmente retopology, normal map, rigging. Non servono voci associate.",
+
+        "Knight": {
+            "_comment": "Umanoide completo — tutti gli step 3D attivi",
+            "concept_img": "TRELLIS/knight_concept.png",
+            "retopology": true,
+            "target_faces": 5000,
+            "normal_map": true,
+            "rig": true,
+            "rig_type": "biped"
+        },
+
+        "Dragon": {
+            "_comment": "Creatura con rig quadrupede",
+            "concept_img": "TRELLIS/dragon_concept.png",
+            "retopology": true,
+            "target_faces": 8000,
+            "normal_map": true,
+            "rig": true,
+            "rig_type": "quadruped"
+        },
+
+        "Sword": {
+            "_comment": "Prop statico — solo mesh + normal, NO rig",
+            "concept_img": "TRELLIS/sword_concept.png",
+            "retopology": true,
+            "target_faces": 2000,
+            "normal_map": true,
+            "rig": false,
+            "rig_type": null
+        },
+
+        "Treasure_Chest": {
+            "_comment": "Prop — solo mesh grezza, niente retopo né rig né normal",
+            "concept_img": "TRELLIS/chest_concept.png",
+            "retopology": false,
+            "target_faces": null,
+            "normal_map": false,
+            "rig": false,
+            "rig_type": null
+        },
+
+        "Ghost": {
+            "_comment": "Entità senza rig (fluttuante) ma con normal map",
+            "concept_img": "TRELLIS/ghost_concept.png",
+            "retopology": true,
+            "target_faces": 3000,
+            "normal_map": true,
+            "rig": false,
+            "rig_type": null
+        },
+
+        "Tree": {
+            "_comment": "Asset ambientale — mesh + retopo, no rig no normal",
+            "concept_img": "TRELLIS/tree_concept.png",
+            "retopology": true,
+            "target_faces": 4000,
+            "normal_map": false,
+            "rig": false,
+            "rig_type": null
+        }
+    },
+
+
+    "voices": {
+        "_comment": "Voci per il voice cloning nei dialoghi. Ogni entry è un voice_ref .wav. NON è necessario che esista un modello 3D corrispondente.",
+
+        "Knight": {
+            "_comment": "Voce maschile profonda — usata nei dialoghi dove il personaggio è 'Knight'",
+            "voice_ref": "audio_refs/knight_voice.wav"
+        },
+        "Dragon": {
+            "_comment": "Voce distorta di creatura",
+            "voice_ref": "audio_refs/dragon_voice.wav"
+        },
+        "Narrator": {
+            "_comment": "Voce del narratore — NON ha nessun modello 3D, è solo audio",
+            "voice_ref": "audio_refs/narrator_voice.wav"
+        },
+        "Villager": {
+            "_comment": "NPC generico — voce senza modello 3D dedicato",
+            "voice_ref": "audio_refs/villager_voice.wav"
+        },
+        "Witch": {
+            "_comment": "Personaggio solo vocale per cutscene",
+            "voice_ref": "audio_refs/witch_voice.wav"
+        }
+    },
+
+
+    "environmental_sfx": [
+        {
+            "_comment": "SFX breve — impatto singolo (1-2s)",
+            "trigger_word": "sword_clash",
+            "prompt": "metal sword clashing against a shield, sharp metallic impact, reverb",
+            "duration": 1.5
+        },
+        {
+            "_comment": "SFX breve — suono UI / feedback (< 1s)",
+            "trigger_word": "coin_pickup",
+            "prompt": "coin pickup chime, bright and cheerful, retro game sound effect",
+            "duration": 0.8
+        },
+        {
+            "_comment": "SFX medio — fuoco ambientale",
+            "trigger_word": "campfire",
+            "prompt": "crackling campfire in a quiet forest at night, wood popping and burning",
+            "duration": 5.0
+        },
+        {
+            "_comment": "SFX medio — creatura",
+            "trigger_word": "dragon_roar",
+            "prompt": "massive dragon roar, deep and terrifying, echoing through a cave",
+            "duration": 4.0
+        },
+        {
+            "_comment": "SFX lungo — loop ambientale vento",
+            "trigger_word": "wind_howl",
+            "prompt": "strong wind howling through a mountain pass, eerie ambient soundscape",
+            "duration": 10.0
+        },
+        {
+            "_comment": "SFX lungo — loop natura",
+            "trigger_word": "forest_ambience",
+            "prompt": "peaceful forest ambience with birds chirping, leaves rustling, distant stream",
+            "duration": 15.0
+        },
+        {
+            "_comment": "SFX medio — dungeon atmosphere",
+            "trigger_word": "dungeon_drip",
+            "prompt": "water dripping in a dark underground dungeon, echoey stone chamber, chains",
+            "duration": 8.0
+        },
+        {
+            "_comment": "SFX breve — magia",
+            "trigger_word": "spell_cast",
+            "prompt": "magical spell casting whoosh, sparkling energy, mystical arcane sound",
+            "duration": 2.0
+        },
+        {
+            "_comment": "SFX medio — esplosione",
+            "trigger_word": "explosion",
+            "prompt": "large fiery explosion with debris, cinematic boom, rumbling aftermath",
+            "duration": 3.5
+        },
+        {
+            "_comment": "SFX breve — passi",
+            "trigger_word": "footsteps_stone",
+            "prompt": "footsteps walking on stone floor, heavy boots, echo in a hall",
+            "duration": 3.0
+        }
+    ],
+
+
+    "world_assets": {
+        "_comment": "Ogni campo è opzionale. Puoi generare solo skybox, solo texture, entrambi, o nessuno.",
+
+        "skyboxes": [
+            {
+                "_comment": "Skybox principale — tramonto epico",
+                "name": "sunset_fantasy",
+                "prompt": "epic fantasy sunset sky with dramatic volumetric clouds, twin moons rising, purple and orange gradient, god rays"
+            },
+            {
+                "_comment": "Skybox notturno — cielo stellato",
+                "name": "night_starfield",
+                "prompt": "dark night sky full of stars, milky way visible, aurora borealis, deep blue and green"
+            },
+            {
+                "_comment": "Skybox dungeon — sotterraneo astratto",
+                "name": "cave_ceiling",
+                "prompt": "underground cave ceiling with stalactites, bioluminescent mushrooms, dark rocky dome, fantasy"
+            }
+        ],
+
+        "textures": [
+            {
+                "_comment": "Texture pavimento — cobblestone medievale",
+                "name": "floor_cobblestone",
+                "prompt": "medieval cobblestone road worn and mossy, wet from rain, cracks with grass, PBR material",
+                "resolution": 1024
+            },
+            {
+                "_comment": "Texture muro — mattoni antichi",
+                "name": "wall_brick",
+                "prompt": "old red brick wall texture, crumbling mortar, some moss, seamless tileable, PBR",
+                "resolution": 1024
+            },
+            {
+                "_comment": "Texture terreno — erba e terra",
+                "name": "ground_grass",
+                "prompt": "grass and dirt ground texture, top down view, patches of green grass and brown earth, seamless",
+                "resolution": 512
+            },
+            {
+                "_comment": "Texture legno — tavole di legno antico",
+                "name": "wood_planks",
+                "prompt": "old wooden planks floor, worn oak wood, scratches and nail holes, seamless tileable PBR",
+                "resolution": 1024
+            },
+            {
+                "_comment": "Texture lava — liquido incandescente",
+                "name": "lava_surface",
+                "prompt": "molten lava surface texture, glowing orange cracks on black cooled basalt, seamless tileable",
+                "resolution": 512
+            }
+        ]
+    }
+}
