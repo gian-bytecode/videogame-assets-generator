@@ -29,7 +29,7 @@ TARGET_DIR = "/content/site_packages"
 REMOTE_PREFIX = "site_packages"
 
 # Chunk size for uploads (must match server's max_message_size)
-UPLOAD_CHUNK = 8 * 1024 * 1024  # 8 MiB
+UPLOAD_CHUNK = 2 * 1024 * 1024  # 2 MiB
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # PACKAGE LIST — Each entry = one pip install + upload cycle
