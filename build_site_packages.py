@@ -16,7 +16,7 @@
 # CONFIGURATION — Edit before running
 # ═══════════════════════════════════════════════════════════════════════════════
 # %%
-
+from __future__ import annotations
 # VPS server address (must match server config — use wss:// with TLS)
 VPS_URL = "wss://YOUR_VPS_IP_OR_DOMAIN:9999"
 
@@ -91,7 +91,7 @@ PACKAGES: list[dict] = [
 # ═══════════════════════════════════════════════════════════════════════════════
 # %%
 
-from __future__ import annotations
+
 
 import getpass
 import hashlib

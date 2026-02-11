@@ -14,7 +14,7 @@
 # CONFIGURATION — Edit these before running
 # ═══════════════════════════════════════════════════════════════════════════════
 # %%
-
+from __future__ import annotations
 # GitHub repository (HTTPS clone URL)
 GITHUB_REPO = "https://github.com/YOUR_USERNAME/videogame-assets-generator.git"
 GITHUB_BRANCH = "main"
@@ -34,7 +34,7 @@ SITE_PACKAGES_DIR = "site_packages"  # pip --target packages
 # ═══════════════════════════════════════════════════════════════════════════════
 # %%
 
-from __future__ import annotations
+
 
 import getpass
 import hashlib
