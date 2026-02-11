@@ -350,8 +350,8 @@ def upload_diff(client: VPSUploadClient, target: Path) -> tuple[int, int]:
     if not to_upload:
         return 0, 0
 
-    # ── Create zip containing only the diff ──
-    print("    📦 Compressing diff …", end=" ", flush=True)
+    # ── Create zip archive (STORED — no compression, speed over size) ──
+    print("    📦 Archiving diff …", end=" ", flush=True)
     zip_fd, zip_path_str = tempfile.mkstemp(suffix=".zip")
     os.close(zip_fd)
     zip_path = Path(zip_path_str)
@@ -359,7 +359,7 @@ def upload_diff(client: VPSUploadClient, target: Path) -> tuple[int, int]:
     total_raw = 0
     file_count = 0
     try:
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) as zf:
             for remote_rel in to_upload:
                 local_rel = remote_rel[len(REMOTE_PREFIX) + 1:]  # strip prefix
                 local_file = target / local_rel
@@ -369,11 +369,9 @@ def upload_diff(client: VPSUploadClient, target: Path) -> tuple[int, int]:
                     file_count += 1
 
         zip_size = zip_path.stat().st_size
-        ratio = (zip_size / total_raw * 100) if total_raw > 0 else 0
         print(
             f"{file_count} files, "
-            f"{total_raw / (1024**2):.1f} → {zip_size / (1024**2):.1f} MiB "
-            f"({ratio:.0f}%)"
+            f"{total_raw / (1024**2):.1f} MiB"
         )
 
         # ── Upload the zip ──

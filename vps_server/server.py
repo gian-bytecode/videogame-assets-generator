@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import concurrent.futures
 import hashlib
 import json
 import logging
@@ -100,6 +101,9 @@ PROGRESS_FILE: Path = Path("build_progress.json")
 
 # Per-connection upload state: ws_id → {path, sha256, size, received, hasher, fh}
 UPLOAD_STATE: dict[int, dict[str, Any]] = {}
+
+# Thread pool for blocking I/O (zip extraction) so the event loop stays alive
+_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=2)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -391,34 +395,26 @@ async def handle_upload_zip_done(ws: Any, data: dict) -> None:
         }))
         return
 
-    # Extract zip into FILE_ROOT
-    extracted = 0
-    root_resolved = FILE_ROOT.resolve()
+    # Extract zip in a worker thread so the event-loop keeps sending
+    # keepalive pings and the connection doesn't drop.
+    loop = asyncio.get_running_loop()
     try:
-        with zipfile.ZipFile(tmp_path, "r") as zf:
-            for info in zf.infolist():
-                if info.is_dir():
-                    continue
-                # Security: reject path-traversal attempts
-                member = Path(info.filename)
-                if ".." in member.parts:
-                    LOG.warning("⚠️  Skipping traversal attempt: %s", info.filename)
-                    continue
-                target = (FILE_ROOT / info.filename).resolve()
-                if not str(target).startswith(str(root_resolved) + os.sep) and target != root_resolved:
-                    LOG.warning("⚠️  Skipping escape attempt: %s", info.filename)
-                    continue
-                target.parent.mkdir(parents=True, exist_ok=True)
-                with zf.open(info) as src, open(target, "wb") as dst:
-                    shutil.copyfileobj(src, dst)
-                extracted += 1
+        extracted = await loop.run_in_executor(
+            _EXECUTOR,
+            _extract_zip_blocking,
+            tmp_path,
+            FILE_ROOT,
+        )
     except zipfile.BadZipFile:
         tmp_path.unlink(missing_ok=True)
         LOG.error("❌ Bad zip file received (%s bytes)", f"{state['received']:,}")
         await ws.send(json.dumps({"status": "error", "message": "Invalid zip file"}))
         return
-    finally:
+    except Exception as exc:
         tmp_path.unlink(missing_ok=True)
+        LOG.exception("❌ Zip extraction error: %s", exc)
+        await ws.send(json.dumps({"status": "error", "message": f"Extraction error: {exc}"}))
+        return
 
     LOG.info("📥 Zip extracted: %d files (%s bytes, sha256:%s…)",
              extracted, f"{state['received']:,}", actual_sha[:16])
@@ -427,6 +423,33 @@ async def handle_upload_zip_done(ws: Any, data: dict) -> None:
         "verified": True,
         "extracted": extracted,
     }))
+
+
+def _extract_zip_blocking(zip_path: Path, file_root: Path) -> int:
+    """Extract a zip into file_root (runs in a thread). Returns file count."""
+    extracted = 0
+    root_resolved = file_root.resolve()
+    try:
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            for info in zf.infolist():
+                if info.is_dir():
+                    continue
+                # Security: reject path-traversal attempts
+                member = Path(info.filename)
+                if ".." in member.parts:
+                    LOG.warning("⚠️  Skipping traversal attempt: %s", info.filename)
+                    continue
+                target = (file_root / info.filename).resolve()
+                if not str(target).startswith(str(root_resolved) + os.sep) and target != root_resolved:
+                    LOG.warning("⚠️  Skipping escape attempt: %s", info.filename)
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with zf.open(info) as src, open(target, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+                extracted += 1
+    finally:
+        zip_path.unlink(missing_ok=True)
+    return extracted
 
 
 async def handle_upload_verify(ws: Any, data: dict) -> None:
