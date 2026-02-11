@@ -86,7 +86,7 @@ LOG.addHandler(_handler)
 # ──────────────────────────────────────────────────────────────────────────────
 # Constants
 # ──────────────────────────────────────────────────────────────────────────────
-CHUNK_SIZE = 1 * 1024 * 1024  # 1 MiB per WebSocket frame
+CHUNK_SIZE = 8 * 1024 * 1024  # 8 MiB per WebSocket frame
 SESSION_TTL = 3600            # 1 hour
 MAX_SESSIONS = 32             # prevent DoS from filling RAM
 

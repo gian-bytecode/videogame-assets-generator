@@ -29,7 +29,7 @@ TARGET_DIR = "/content/site_packages"
 REMOTE_PREFIX = "site_packages"
 
 # Chunk size for uploads (must match server's max_message_size)
-UPLOAD_CHUNK = 1 * 1024 * 1024  # 1 MiB
+UPLOAD_CHUNK = 8 * 1024 * 1024  # 8 MiB
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # PACKAGE LIST — Each entry = one pip install + upload cycle
@@ -50,7 +50,7 @@ PACKAGES: list[dict] = [
     {"name": "huggingface_hub",     "pip": "huggingface_hub"},
     # ── 2. TRELLIS deps ──
     {"name": "kaolin",              "pip": "kaolin",              "extra": "-f https://nvidia-kaolin.s3.us-east-2.amazonaws.com/torch-2.1.0_cu121.html"},
-    {"name": "nvdiffrast",          "pip": "nvdiffrast"},
+    {"name": "nvdiffrast",          "pip": "git+https://github.com/NVlabs/nvdiffrast.git"},
     {"name": "xatlas",              "pip": "xatlas"},
     {"name": "plyfile",             "pip": "plyfile"},
     {"name": "imageio",             "pip": "imageio"},

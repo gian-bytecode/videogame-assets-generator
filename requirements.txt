@@ -22,7 +22,10 @@ huggingface_hub
 # ---------- TRELLIS (3D Generation) ----------
 # kaolin necessita di installazione separata con il flag -f:
 #   pip install kaolin -f https://nvidia-kaolin.s3.us-east-2.amazonaws.com/torch-2.1.0_cu121.html
-nvdiffrast
+
+# nvdiffrast va installato da git:
+#   pip install git+https://github.com/NVlabs/nvdiffrast.git
+
 xatlas
 plyfile
 pygltflib
