@@ -25,6 +25,7 @@ huggingface_hub
 nvdiffrast
 xatlas
 plyfile
+pygltflib
 imageio
 
 # TRELLIS va installato da git:
@@ -42,6 +43,7 @@ rtree
 
 # ---------- Fish Speech (TTS + Voice Cloning) ----------
 fish-speech
+datasets
 
 # ---------- AudioCraft (Sound FX) ----------
 audiocraft
