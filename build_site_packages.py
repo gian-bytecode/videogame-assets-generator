@@ -105,6 +105,7 @@ import sys
 import tempfile
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -140,10 +141,15 @@ def sha256_file(path: Path) -> str:
 
 
 def hash_directory(root: Path) -> dict[str, dict[str, Any]]:
-    """Return {relative_posix_path: {sha256, size}} for all files under root."""
-    result: dict[str, dict[str, Any]] = {}
+    """Return {relative_posix_path: {sha256, size}} for all files under root.
+
+    Hashing is parallelised across CPU cores for speed.
+    """
     if not root.is_dir():
-        return result
+        return {}
+
+    # Collect file list first (fast, single-threaded walk)
+    file_list: list[tuple[str, Path]] = []
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if not d.startswith(".")]
         for fname in filenames:
@@ -151,11 +157,21 @@ def hash_directory(root: Path) -> dict[str, dict[str, Any]]:
                 continue
             full = Path(dirpath) / fname
             rel = full.relative_to(root).as_posix()
+            file_list.append((rel, full))
+
+    # Hash in parallel
+    result: dict[str, dict[str, Any]] = {}
+    workers = min(os.cpu_count() or 4, 8)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(sha256_file, full): (rel, full)
+            for rel, full in file_list
+        }
+        for fut in as_completed(futures):
+            rel, full = futures[fut]
             try:
-                result[rel] = {
-                    "sha256": sha256_file(full),
-                    "size": full.stat().st_size,
-                }
+                h = fut.result()
+                result[rel] = {"sha256": h, "size": full.stat().st_size}
             except OSError:
                 pass
     return result

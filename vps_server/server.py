@@ -123,8 +123,13 @@ def sha256_file(path: Path) -> str:
 
 
 def build_manifest() -> dict[str, dict[str, Any]]:
-    """Walk FILE_ROOT and return {relative_path: {sha256, size}} for every file."""
-    manifest: dict[str, dict[str, Any]] = {}
+    """Walk FILE_ROOT and return {relative_path: {sha256, size}} for every file.
+
+    Hashing is parallelised across CPU cores (this function is blocking and
+    should be called via run_in_executor from async code).
+    """
+    # Collect file list (single-threaded walk — fast)
+    file_list: list[tuple[str, Path]] = []
     for root, _dirs, files in os.walk(FILE_ROOT):
         _dirs[:] = [d for d in _dirs if not d.startswith(".")]
         for fname in files:
@@ -132,14 +137,23 @@ def build_manifest() -> dict[str, dict[str, Any]]:
                 continue
             full = Path(root) / fname
             rel = full.relative_to(FILE_ROOT).as_posix()
+            file_list.append((rel, full))
+
+    # Hash in parallel
+    manifest: dict[str, dict[str, Any]] = {}
+    workers = min(os.cpu_count() or 4, 8)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(sha256_file, full): (rel, full)
+            for rel, full in file_list
+        }
+        for fut in concurrent.futures.as_completed(futures):
+            rel, full = futures[fut]
             try:
-                stat = full.stat()
-                manifest[rel] = {
-                    "sha256": sha256_file(full),
-                    "size": stat.st_size,
-                }
+                h = fut.result()
+                manifest[rel] = {"sha256": h, "size": full.stat().st_size}
             except OSError as exc:
-                LOG.warning("Cannot stat %s: %s", rel, exc)
+                LOG.warning("Cannot hash %s: %s", rel, exc)
     return manifest
 
 
@@ -243,7 +257,8 @@ async def handle_manifest(ws: Any, data: dict) -> None:
         return
 
     LOG.info("📋 Building manifest …")
-    manifest = build_manifest()
+    loop = asyncio.get_running_loop()
+    manifest = await loop.run_in_executor(_EXECUTOR, build_manifest)
     LOG.info("📋 Manifest: %d files", len(manifest))
     await ws.send(json.dumps({"status": "ok", "files": manifest}))
 
@@ -254,7 +269,8 @@ async def handle_verify(ws: Any, data: dict) -> None:
         return
 
     client_files: dict[str, str] = data.get("files", {})
-    server_manifest = build_manifest()
+    loop = asyncio.get_running_loop()
+    server_manifest = await loop.run_in_executor(_EXECUTOR, build_manifest)
 
     to_download: list[str] = []
     for rel_path, info in server_manifest.items():
@@ -281,7 +297,8 @@ async def handle_download(ws: Any, data: dict) -> None:
         return
 
     file_size = target.stat().st_size
-    file_hash = sha256_file(target)
+    loop = asyncio.get_running_loop()
+    file_hash = await loop.run_in_executor(_EXECUTOR, sha256_file, target)
     total_chunks = (file_size + CHUNK_SIZE - 1) // CHUNK_SIZE
     if total_chunks == 0:
         total_chunks = 1
@@ -459,7 +476,8 @@ async def handle_upload_verify(ws: Any, data: dict) -> None:
         return
 
     client_files: dict[str, str] = data.get("files", {})
-    server_manifest = build_manifest()
+    loop = asyncio.get_running_loop()
+    server_manifest = await loop.run_in_executor(_EXECUTOR, build_manifest)
 
     to_upload: list[str] = []
     for rel_path, client_hash in client_files.items():
