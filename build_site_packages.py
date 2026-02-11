@@ -19,6 +19,8 @@
 from __future__ import annotations
 # VPS server address (must match server config — use wss:// with TLS)
 VPS_URL = "wss://YOUR_VPS_IP_OR_DOMAIN:9999"
+if "YOUR_VPS_IP_OR_DOMAIN" in VPS_URL:
+    VPS_URL=f"wss://{input('Enter VPS IP or domain: ')}:9999"
 
 # Local install target (Colab ephemeral disk — NOT Drive)
 TARGET_DIR = "/content/site_packages"

@@ -16,11 +16,14 @@
 # %%
 from __future__ import annotations
 # GitHub repository (HTTPS clone URL)
-GITHUB_REPO = "https://github.com/YOUR_USERNAME/videogame-assets-generator.git"
+GITHUB_REPO = "https://github.com/gian-bytecode/videogame-assets-generator.git"
 GITHUB_BRANCH = "main"
 
 # VPS server address (use wss:// with TLS, or ws:// for testing only)
 VPS_URL = "wss://YOUR_VPS_IP_OR_DOMAIN:9999"
+if "YOUR_VPS_IP_OR_DOMAIN" in VPS_URL:
+    VPS_URL=f"wss://{input('Enter VPS IP or domain: ')}:9999"
+
 
 # Local workspace root (on Colab's ephemeral disk)
 WORKSPACE = "/content/videogame-assets-generator"
