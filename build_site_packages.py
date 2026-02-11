@@ -5,8 +5,9 @@
 #
 # For each package:
 # 1. `pip install --target` into `/content/site_packages`
-# 2. Hash all files, diff against VPS, upload only new/changed files
-# 3. Mark the package as completed on the VPS
+# 2. Hash local files, diff against VPS to find new/changed files
+# 3. Zip only the diff → upload a single archive → server extracts
+# 4. Mark the package as completed on the VPS
 #
 # On re-run (e.g. after Colab timeout), asks the VPS which packages are
 # already done and **resumes from where it left off**.
@@ -99,7 +100,9 @@ import os
 import ssl
 import subprocess
 import sys
+import tempfile
 import time
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -238,47 +241,58 @@ class VPSUploadClient:
             raise RuntimeError(f"upload_verify error: {resp.get('message')}")
         return resp.get("to_upload", [])
 
-    # ── Upload a single file ──
+    # ── Upload a zip archive ──
 
-    def upload_file(self, local_path: Path, remote_rel: str) -> bool:
-        """Upload one file to the VPS. Returns True if verified OK."""
-        file_size = local_path.stat().st_size
-        file_hash = sha256_file(local_path)
+    def upload_zip(self, zip_path: Path) -> dict[str, Any]:
+        """Upload a zip file to VPS for server-side extraction.
+
+        Returns the server response dict (contains 'verified' and 'extracted').
+        """
+        file_size = zip_path.stat().st_size
+        file_hash = sha256_file(zip_path)
 
         # Begin
         self.ws.send(json.dumps({
-            "action": "upload_begin",
+            "action": "upload_zip_begin",
             "session_id": self.session_id,
-            "path": remote_rel,
             "sha256": file_hash,
             "size": file_size,
         }))
         resp = json.loads(self.ws.recv())
         if resp.get("status") != "ok":
-            print(f"    ❌ upload_begin error: {resp.get('message')}")
-            return False
+            print(f"    ❌ upload_zip_begin error: {resp.get('message')}")
+            return resp
 
-        # Chunks
-        with open(local_path, "rb") as f:
+        # Send binary chunks with progress
+        sent = 0
+        t0 = time.time()
+        with open(zip_path, "rb") as f:
             while True:
                 chunk = f.read(UPLOAD_CHUNK)
                 if not chunk:
                     break
                 self.ws.send(chunk)
+                sent += len(chunk)
+                elapsed = time.time() - t0
+                pct = sent / file_size * 100
+                speed = sent / (1024**2) / max(elapsed, 0.001)
+                print(
+                    f"\r    📤 {sent / (1024**2):.1f}/{file_size / (1024**2):.1f} MiB"
+                    f" ({pct:.0f}%) — {speed:.1f} MiB/s",
+                    end="", flush=True,
+                )
+        print()  # newline after progress bar
 
         # Done
         self.ws.send(json.dumps({
-            "action": "upload_done",
+            "action": "upload_zip_done",
             "session_id": self.session_id,
-            "path": remote_rel,
             "sha256": file_hash,
         }))
         resp = json.loads(self.ws.recv())
         if resp.get("status") != "ok":
-            print(f"    ❌ upload_done error: {resp.get('message')}")
-            return False
-
-        return resp.get("verified", False)
+            print(f"    ❌ upload_zip_done error: {resp.get('message')}")
+        return resp
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -313,7 +327,8 @@ def pip_install(pkg: dict, target: str) -> bool:
 
 def upload_diff(client: VPSUploadClient, target: Path) -> tuple[int, int]:
     """
-    Hash local site_packages, ask server which files differ, upload them.
+    Hash local site_packages, ask server which files differ, zip them,
+    send the single archive, and let the server extract.
     Returns (uploaded_count, failed_count).
     """
     print("    🔍 Hashing local files …", end=" ", flush=True)
@@ -333,40 +348,43 @@ def upload_diff(client: VPSUploadClient, target: Path) -> tuple[int, int]:
     if not to_upload:
         return 0, 0
 
-    # Calculate total upload size
-    total_bytes = 0
-    for remote_rel in to_upload:
-        # Strip prefix to get local relative path
-        local_rel = remote_rel[len(REMOTE_PREFIX) + 1:]  # skip "site_packages/"
-        local_file = target / local_rel
-        if local_file.is_file():
-            total_bytes += local_file.stat().st_size
-    print(f"    📤 Uploading {len(to_upload)} files ({total_bytes / (1024**2):.1f} MiB) …")
+    # ── Create zip containing only the diff ──
+    print("    📦 Compressing diff …", end=" ", flush=True)
+    zip_fd, zip_path_str = tempfile.mkstemp(suffix=".zip")
+    os.close(zip_fd)
+    zip_path = Path(zip_path_str)
 
-    uploaded = 0
-    failed = 0
-    t0 = time.time()
+    total_raw = 0
+    file_count = 0
+    try:
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+            for remote_rel in to_upload:
+                local_rel = remote_rel[len(REMOTE_PREFIX) + 1:]  # strip prefix
+                local_file = target / local_rel
+                if local_file.is_file():
+                    zf.write(str(local_file), arcname=remote_rel)
+                    total_raw += local_file.stat().st_size
+                    file_count += 1
 
-    for i, remote_rel in enumerate(to_upload, 1):
-        local_rel = remote_rel[len(REMOTE_PREFIX) + 1:]
-        local_file = target / local_rel
+        zip_size = zip_path.stat().st_size
+        ratio = (zip_size / total_raw * 100) if total_raw > 0 else 0
+        print(
+            f"{file_count} files, "
+            f"{total_raw / (1024**2):.1f} → {zip_size / (1024**2):.1f} MiB "
+            f"({ratio:.0f}%)"
+        )
 
-        if not local_file.is_file():
-            failed += 1
-            continue
+        # ── Upload the zip ──
+        resp = client.upload_zip(zip_path)
+        if not resp.get("verified"):
+            return 0, file_count
 
-        ok = client.upload_file(local_file, remote_rel)
-        if ok:
-            uploaded += 1
-        else:
-            failed += 1
+        extracted = resp.get("extracted", 0)
+        print(f"    ✅ Server extracted {extracted} files")
+        return file_count, 0
 
-        # Progress every 100 files or at the end
-        if i % 100 == 0 or i == len(to_upload):
-            elapsed = time.time() - t0
-            print(f"    … {i}/{len(to_upload)} ({elapsed:.0f}s)")
-
-    return uploaded, failed
+    finally:
+        zip_path.unlink(missing_ok=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

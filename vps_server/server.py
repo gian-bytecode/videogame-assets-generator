@@ -31,15 +31,15 @@ Protocol (all JSON over WSS, except binary chunks):
     ← <binary chunk 1>  …  <binary chunk N>
     ← {"status":"transfer_complete", "sha256":"..."}
 
-  ── Upload (client → server) ──
-    → {"action":"upload_begin", "session_id":"...", "path":"rel/path", "sha256":"...", "size":N}
-    ← {"status":"ok",          "ready":true}
-    → <binary chunk 1>  …  <binary chunk N>
-    → {"action":"upload_done",  "session_id":"...", "path":"rel/path", "sha256":"..."}
-    ← {"status":"ok",          "verified":true}
-
+  ── Upload (client → server, zip-based) ──
     → {"action":"upload_verify","session_id":"...", "files":{"rel/path":"sha256",...}}
     ← {"status":"ok",          "to_upload":["rel/path1",...]}
+
+    → {"action":"upload_zip_begin", "session_id":"...", "sha256":"...", "size":N}
+    ← {"status":"ok",              "ready":true}
+    → <binary chunk 1>  …  <binary chunk N>
+    → {"action":"upload_zip_done",  "session_id":"...", "sha256":"..."}
+    ← {"status":"ok",              "verified":true, "extracted":N}
 
   ── Build Progress ──
     → {"action":"get_progress",  "session_id":"..."}
@@ -61,9 +61,11 @@ import json
 import logging
 import os
 import secrets
+import shutil
 import ssl
 import sys
 import time
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -307,38 +309,27 @@ async def handle_download(ws: Any, data: dict) -> None:
 # Protocol Handlers — Upload (client → server)
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def handle_upload_begin(ws: Any, data: dict) -> None:
-    """Prepare to receive a file from the client."""
+async def handle_upload_zip_begin(ws: Any, data: dict) -> None:
+    """Prepare to receive a zip archive from the client."""
     if not validate_session(data.get("session_id")):
         await ws.send(json.dumps({"status": "error", "message": "Invalid session"}))
         return
 
-    rel_path = data.get("path", "")
     expected_sha = data.get("sha256", "")
     expected_size = data.get("size", 0)
 
-    if not rel_path or not expected_sha:
-        await ws.send(json.dumps({"status": "error", "message": "path and sha256 required"}))
+    if not expected_sha:
+        await ws.send(json.dumps({"status": "error", "message": "sha256 required"}))
         return
 
-    target = safe_resolve(rel_path, must_exist=False)
-    if target is None:
-        await ws.send(json.dumps({
-            "status": "error",
-            "message": f"Invalid path: {rel_path}"
-        }))
-        return
-
-    # Prepare the directory and temp file
-    target.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = target.with_suffix(target.suffix + ".tmp")
-
+    # Temp file inside FILE_ROOT for the incoming zip
+    tmp_path = FILE_ROOT / f".upload_{secrets.token_hex(8)}.zip"
     fh = open(tmp_path, "wb")
 
     ws_id = id(ws)
     UPLOAD_STATE[ws_id] = {
-        "path": rel_path,
-        "target": target,
+        "type": "zip",
+        "path": "<zip>",
         "tmp_path": tmp_path,
         "expected_sha": expected_sha,
         "expected_size": expected_size,
@@ -347,7 +338,7 @@ async def handle_upload_begin(ws: Any, data: dict) -> None:
         "fh": fh,
     }
 
-    LOG.info("📥 Upload begin: %s (%s bytes)", rel_path, f"{expected_size:,}")
+    LOG.info("📥 Zip upload begin: %s bytes expected", f"{expected_size:,}")
     await ws.send(json.dumps({"status": "ok", "ready": True}))
 
 
@@ -367,8 +358,8 @@ async def handle_upload_chunk(ws: Any, chunk: bytes) -> None:
     state["received"] += len(chunk)
 
 
-async def handle_upload_done(ws: Any, data: dict) -> None:
-    """Finalize an upload: verify hash, move to final location."""
+async def handle_upload_zip_done(ws: Any, data: dict) -> None:
+    """Finalize zip upload: verify hash, extract all files into FILE_ROOT."""
     if not validate_session(data.get("session_id")):
         await ws.send(json.dumps({"status": "error", "message": "Invalid session"}))
         return
@@ -387,29 +378,55 @@ async def handle_upload_done(ws: Any, data: dict) -> None:
     actual_sha = state["hasher"].hexdigest()
     expected_sha = data.get("sha256", state["expected_sha"])
     tmp_path: Path = state["tmp_path"]
-    target: Path = state["target"]
-    rel_path = state["path"]
 
     if actual_sha != expected_sha:
         tmp_path.unlink(missing_ok=True)
-        LOG.warning("❌ Upload hash mismatch: %s (expected %s, got %s)",
-                    rel_path, expected_sha[:16], actual_sha[:16])
+        LOG.warning("❌ Zip hash mismatch (expected %s, got %s)",
+                    expected_sha[:16], actual_sha[:16])
         await ws.send(json.dumps({
             "status": "error",
-            "message": f"Hash mismatch for {rel_path}",
+            "message": "Zip hash mismatch",
             "expected": expected_sha,
             "actual": actual_sha,
         }))
         return
 
-    # Atomic replace
-    if target.exists():
-        target.unlink()
-    tmp_path.rename(target)
+    # Extract zip into FILE_ROOT
+    extracted = 0
+    root_resolved = FILE_ROOT.resolve()
+    try:
+        with zipfile.ZipFile(tmp_path, "r") as zf:
+            for info in zf.infolist():
+                if info.is_dir():
+                    continue
+                # Security: reject path-traversal attempts
+                member = Path(info.filename)
+                if ".." in member.parts:
+                    LOG.warning("⚠️  Skipping traversal attempt: %s", info.filename)
+                    continue
+                target = (FILE_ROOT / info.filename).resolve()
+                if not str(target).startswith(str(root_resolved) + os.sep) and target != root_resolved:
+                    LOG.warning("⚠️  Skipping escape attempt: %s", info.filename)
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with zf.open(info) as src, open(target, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+                extracted += 1
+    except zipfile.BadZipFile:
+        tmp_path.unlink(missing_ok=True)
+        LOG.error("❌ Bad zip file received (%s bytes)", f"{state['received']:,}")
+        await ws.send(json.dumps({"status": "error", "message": "Invalid zip file"}))
+        return
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
-    LOG.info("📥 Upload OK: %s (%s bytes, sha256:%s…)",
-             rel_path, f"{state['received']:,}", actual_sha[:16])
-    await ws.send(json.dumps({"status": "ok", "verified": True, "path": rel_path}))
+    LOG.info("📥 Zip extracted: %d files (%s bytes, sha256:%s…)",
+             extracted, f"{state['received']:,}", actual_sha[:16])
+    await ws.send(json.dumps({
+        "status": "ok",
+        "verified": True,
+        "extracted": extracted,
+    }))
 
 
 async def handle_upload_verify(ws: Any, data: dict) -> None:
@@ -494,8 +511,8 @@ HANDLERS = {
     "verify": handle_verify,
     "download": handle_download,
     # Upload
-    "upload_begin": handle_upload_begin,
-    "upload_done": handle_upload_done,
+    "upload_zip_begin": handle_upload_zip_begin,
+    "upload_zip_done": handle_upload_zip_done,
     "upload_verify": handle_upload_verify,
     # Progress
     "get_progress": handle_get_progress,
