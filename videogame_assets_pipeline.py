@@ -56,6 +56,7 @@ print("✅ All dependencies are ready.")
 
 import gc
 import glob
+import io
 import json
 import logging
 import os
@@ -336,20 +337,21 @@ def parse_dialogues(audio_texts_dir: Path) -> Dict[str, List[DialogueLine]]:
 # ═══════════════════════════════════════════════════════════════════════════════
 # %%
 
-def step1_trellis_3d(cfg: PipelineConfig) -> Dict[str, Path]:
+def step1_trellis_3d(cfg: PipelineConfig) -> Dict[str, dict]:
     """
-    STEP 1 — Generate raw 3D meshes (.obj) from concept images using
-    microsoft/TRELLIS-image-large.
-    Reads from cfg.models_3d (independent from voices).
-    Returns: dict[asset_name -> path_to_raw_obj]
+    STEP 1 — Generate raw 3D meshes (.obj) + textures from concept images
+    using microsoft/TRELLIS-image-large.
+
+    Returns: dict[asset_name -> {"mesh": Path, "texture": Path | None}]
+    The texture is the high-poly colour map that TRELLIS bakes onto the mesh.
     """
     log_step_banner(1, "3D Generation — TRELLIS")
-    raw_meshes: Dict[str, Path] = {}
+    trellis_outputs: Dict[str, dict] = {}
 
     if not cfg.models_3d:
         LOG.info("ℹ️ No 3D models defined in config — skipping STEP 1.")
         log_step_done(1)
-        return raw_meshes
+        return trellis_outputs
 
     try:
         import trimesh
@@ -379,32 +381,85 @@ def step1_trellis_3d(cfg: PipelineConfig) -> Dict[str, Path]:
                 formats=["mesh", "gaussian"],
             )
 
-            # Extract the mesh — TRELLIS outputs vary by version:
-            # Attempt 1: pipeline may directly expose a trimesh/GLB export
+            # ── Extract mesh + texture from TRELLIS output ────────────
             out_obj = OUTPUT_3D / f"{asset_name}_raw.obj"
+            out_tex = OUTPUT_TEX / f"{asset_name}_highpoly_diffuse.png"
+            texture_saved: Path | None = None
+
+            # Helper to load a GLB, save OBJ + extract texture
+            def _glb_to_obj_tex(glb_path: Path) -> trimesh.Trimesh:
+                scene = trimesh.load(str(glb_path))
+                if isinstance(scene, trimesh.Scene):
+                    mesh = trimesh.util.concatenate(scene.dump())
+                else:
+                    mesh = scene
+                return mesh
+
+            def _try_extract_texture(mesh_or_scene, fallback_glb: Path | None = None):
+                """Try to pull a diffuse texture image from the mesh material."""
+                nonlocal texture_saved
+                targets = [mesh_or_scene]
+                if hasattr(mesh_or_scene, 'geometry'):
+                    targets = list(mesh_or_scene.geometry.values())
+                for m in targets:
+                    mat = getattr(m, 'visual', None)
+                    if mat is None:
+                        continue
+                    # SimpleMaterial with image
+                    if hasattr(mat, 'material'):
+                        im = getattr(mat.material, 'image', None)
+                        if im is not None:
+                            im.save(str(out_tex))
+                            texture_saved = out_tex
+                            return
+                    # TextureVisuals
+                    if hasattr(mat, 'material') and hasattr(mat.material, 'baseColorTexture'):
+                        bct = mat.material.baseColorTexture
+                        if bct is not None:
+                            bct.save(str(out_tex))
+                            texture_saved = out_tex
+                            return
+                # Last resort: try reading the GLB again with full material
+                if fallback_glb and fallback_glb.exists():
+                    try:
+                        import pygltflib
+                        gltf = pygltflib.GLTF2().load(str(fallback_glb))
+                        if gltf.images:
+                            import base64
+                            img_data = gltf.images[0]
+                            if img_data.uri and img_data.uri.startswith('data:'):
+                                header, b64 = img_data.uri.split(',', 1)
+                                raw = base64.b64decode(b64)
+                                Image.open(io.BytesIO(raw)).save(str(out_tex))
+                                texture_saved = out_tex
+                    except Exception:
+                        pass
 
             if hasattr(outputs, "mesh") and outputs.mesh is not None:
                 mesh_data = outputs.mesh[0] if isinstance(outputs.mesh, list) else outputs.mesh
-                # Try to export via trimesh
                 if hasattr(mesh_data, "vertices") and hasattr(mesh_data, "faces"):
                     mesh = trimesh.Trimesh(
                         vertices=np.array(mesh_data.vertices),
                         faces=np.array(mesh_data.faces),
                     )
                     mesh.export(str(out_obj))
+                    _try_extract_texture(mesh_data)
                 elif hasattr(mesh_data, "export"):
-                    mesh_data.export(str(out_obj))
+                    glb_path = out_obj.with_suffix(".glb")
+                    mesh_data.export(str(glb_path))
+                    scene_raw = trimesh.load(str(glb_path))
+                    _try_extract_texture(scene_raw, glb_path)
+                    m = _glb_to_obj_tex(glb_path)
+                    m.export(str(out_obj))
+                    glb_path.unlink(missing_ok=True)
                 else:
-                    # Fallback: save as GLB and convert
                     glb_path = out_obj.with_suffix(".glb")
                     with open(glb_path, "wb") as f:
-                        f.write(mesh_data)
-                    scene = trimesh.load(str(glb_path))
-                    if isinstance(scene, trimesh.Scene):
-                        mesh = trimesh.util.concatenate(scene.dump())
-                    else:
-                        mesh = scene
-                    mesh.export(str(out_obj))
+                        f.write(mesh_data if isinstance(mesh_data, bytes) else bytes(mesh_data))
+                    scene_raw = trimesh.load(str(glb_path))
+                    _try_extract_texture(scene_raw, glb_path)
+                    m = _glb_to_obj_tex(glb_path)
+                    m.export(str(out_obj))
                     glb_path.unlink(missing_ok=True)
             elif isinstance(outputs, dict) and "mesh" in outputs:
                 mesh_data = outputs["mesh"]
@@ -419,19 +474,41 @@ def step1_trellis_3d(cfg: PipelineConfig) -> Dict[str, Path]:
                 else:
                     with open(glb_path, "wb") as f:
                         f.write(bytes(mesh_data))
-                scene = trimesh.load(str(glb_path))
-                if isinstance(scene, trimesh.Scene):
-                    mesh = trimesh.util.concatenate(scene.dump())
-                else:
-                    mesh = scene
-                mesh.export(str(out_obj))
+                scene_raw = trimesh.load(str(glb_path))
+                _try_extract_texture(scene_raw, glb_path)
+                m = _glb_to_obj_tex(glb_path)
+                m.export(str(out_obj))
                 glb_path.unlink(missing_ok=True)
             else:
                 LOG.error("❌ Unexpected TRELLIS output format for %s", asset_name)
                 continue
 
-            raw_meshes[asset_name] = out_obj
+            # Also check TRELLIS output dict for a separate texture field
+            if texture_saved is None:
+                for tex_key in ("texture", "albedo", "color_map", "baseColor"):
+                    tex_obj = None
+                    if isinstance(outputs, dict):
+                        tex_obj = outputs.get(tex_key)
+                    elif hasattr(outputs, tex_key):
+                        tex_obj = getattr(outputs, tex_key)
+                    if tex_obj is not None:
+                        if isinstance(tex_obj, Image.Image):
+                            tex_obj.save(str(out_tex))
+                            texture_saved = out_tex
+                        elif isinstance(tex_obj, np.ndarray):
+                            Image.fromarray(tex_obj).save(str(out_tex))
+                            texture_saved = out_tex
+                        break
+
+            trellis_outputs[asset_name] = {
+                "mesh": out_obj,
+                "texture": texture_saved,
+            }
             LOG.info("  ✔ Saved raw mesh → %s", out_obj.name)
+            if texture_saved:
+                LOG.info("  ✔ Saved high-poly texture → %s", texture_saved.name)
+            else:
+                LOG.warning("  ⚠️ No texture extracted for %s (will use concept image as fallback)", asset_name)
 
         # Cleanup — explicit del BEFORE purge
         del pipeline
@@ -449,7 +526,7 @@ def step1_trellis_3d(cfg: PipelineConfig) -> Dict[str, Path]:
             placeholder = trimesh.creation.box(extents=[1, 2, 1])
             out_obj = OUTPUT_3D / f"{asset_name}_raw.obj"
             placeholder.export(str(out_obj))
-            raw_meshes[asset_name] = out_obj
+            trellis_outputs[asset_name] = {"mesh": out_obj, "texture": None}
             LOG.info("  ⚠️ Placeholder cube saved for '%s'", asset_name)
 
     except Exception as e:
@@ -461,7 +538,7 @@ def step1_trellis_3d(cfg: PipelineConfig) -> Dict[str, Path]:
         purge_vram()
 
     log_step_done(1)
-    return raw_meshes
+    return trellis_outputs
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -523,26 +600,81 @@ def _ensure_instant_meshes() -> Path:
     return INSTANT_MESHES_BIN
 
 
-def step2_retopology(
-    raw_meshes: Dict[str, Path],
-    cfg: PipelineConfig,
-) -> Dict[str, Path]:
+def _uv_unwrap_xatlas(mesh_path: Path) -> Path:
     """
-    STEP 2 — Run Instant Meshes on each raw OBJ that has retopology=true.
-    Returns: dict[asset_name -> path_to_retopo_or_raw_obj]
+    UV-unwrap a mesh using xatlas and save in-place.
+    Returns the same path (now with UVs embedded).
     """
-    log_step_banner(2, "Auto-Retopology — Instant Meshes")
-    retopo_meshes: Dict[str, Path] = {}
+    import trimesh
+    try:
+        import xatlas as _xatlas
+    except ImportError:
+        LOG.warning("⚠️ xatlas not available — skipping UV unwrap for %s", mesh_path.name)
+        return mesh_path
 
-    if not raw_meshes:
+    mesh = trimesh.load(str(mesh_path), force="mesh", process=False)
+    if mesh.vertices.shape[0] == 0:
+        LOG.warning("⚠️ Empty mesh — skipping UV unwrap for %s", mesh_path.name)
+        return mesh_path
+
+    verts = np.array(mesh.vertices, dtype=np.float32)
+    faces = np.array(mesh.faces, dtype=np.uint32)
+
+    # xatlas parametrize
+    LOG.info("    UV unwrap (xatlas): %d verts, %d faces …", len(verts), len(faces))
+    atlas = _xatlas.Atlas()
+    atlas.add_mesh(verts, faces)
+    atlas.generate()
+    vmapping, new_faces, uvs = atlas[0]
+
+    # Remap: xatlas may have split vertices for UV seams
+    new_verts = verts[vmapping]
+
+    # Save as OBJ with UVs
+    with open(mesh_path, "w") as f:
+        for v in new_verts:
+            f.write(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n")
+        for uv in uvs:
+            f.write(f"vt {uv[0]:.6f} {uv[1]:.6f}\n")
+        for face in new_faces:
+            # OBJ is 1-indexed, faces reference both v and vt
+            i0, i1, i2 = face[0] + 1, face[1] + 1, face[2] + 1
+            f.write(f"f {i0}/{i0} {i1}/{i1} {i2}/{i2}\n")
+
+    LOG.info("    ✔ UV unwrap complete: %d verts (after seam splits), %d UVs",
+             len(new_verts), len(uvs))
+    return mesh_path
+
+
+def step2_retopology(
+    trellis_outputs: Dict[str, dict],
+    cfg: PipelineConfig,
+) -> Dict[str, dict]:
+    """
+    STEP 2 — Run Instant Meshes on each raw (high-poly) OBJ that has
+    retopology=true, then UV-unwrap the LOW-POLY mesh via xatlas.
+
+    Returns: dict[asset_name -> {
+        "lowpoly":  Path,          # retopo mesh with UVs
+        "highpoly": Path,          # original TRELLIS mesh (untouched)
+        "texture_highpoly": Path | None,  # high-poly colour texture
+    }]
+    """
+    log_step_banner(2, "Auto-Retopology + UV Unwrap")
+    retopo_results: Dict[str, dict] = {}
+
+    if not trellis_outputs:
         LOG.info("ℹ️ No raw meshes to retopologize — skipping STEP 2.")
         log_step_done(2)
-        return retopo_meshes
+        return retopo_results
 
     try:
         im_bin = _ensure_instant_meshes()
 
-        for asset_name, raw_obj in tqdm(raw_meshes.items(), desc="Retopology"):
+        for asset_name, t_out in tqdm(trellis_outputs.items(), desc="Retopology"):
+            raw_obj: Path = t_out["mesh"]
+            hp_texture: Path | None = t_out.get("texture")
+
             if not raw_obj.exists():
                 LOG.warning("⚠️ Raw mesh missing for %s, skipping.", asset_name)
                 continue
@@ -550,7 +682,13 @@ def step2_retopology(
             model_cfg = cfg.models_3d.get(asset_name)
             if model_cfg and not model_cfg.retopology:
                 LOG.info("  ─ Retopology disabled for '%s' — keeping raw mesh.", asset_name)
-                retopo_meshes[asset_name] = raw_obj
+                if model_cfg.normal_map:
+                    _uv_unwrap_xatlas(raw_obj)
+                retopo_results[asset_name] = {
+                    "lowpoly": raw_obj,
+                    "highpoly": raw_obj,
+                    "texture_highpoly": hp_texture,
+                }
                 continue
 
             target_faces = model_cfg.target_faces if model_cfg else 5000
@@ -576,136 +714,527 @@ def step2_retopology(
             else:
                 LOG.info("  ✔ Retopo mesh saved → %s", out_obj.name)
 
-            retopo_meshes[asset_name] = out_obj
+            # UV-unwrap the LOW-POLY mesh only
+            _uv_unwrap_xatlas(out_obj)
+            retopo_results[asset_name] = {
+                "lowpoly": out_obj,
+                "highpoly": raw_obj,
+                "texture_highpoly": hp_texture,
+            }
 
     except FileNotFoundError as e:
         LOG.error("❌ Instant Meshes not available: %s", e)
-        for asset_name, raw_obj in raw_meshes.items():
+        for asset_name, t_out in trellis_outputs.items():
+            raw_obj = t_out["mesh"]
             out_obj = OUTPUT_3D / f"{asset_name}_retopo.obj"
             if raw_obj.exists():
                 shutil.copy2(raw_obj, out_obj)
-            retopo_meshes[asset_name] = out_obj
-        LOG.info("  ⚠️ Fallback: copied raw meshes without retopology.")
+            _uv_unwrap_xatlas(out_obj)
+            retopo_results[asset_name] = {
+                "lowpoly": out_obj,
+                "highpoly": raw_obj,
+                "texture_highpoly": t_out.get("texture"),
+            }
+        LOG.info("  ⚠️ Fallback: copied raw meshes without retopology (UVs generated).")
 
     except Exception as e:
         LOG.error("❌ Retopology step failed: %s", e, exc_info=True)
 
     log_step_done(2)
-    return retopo_meshes
+    return retopo_results
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CELL 5 — STEP 3: NORMAL MAP GENERATION WITH STABLENORMAL
+# CELL 5 — STEP 3: HIGH→LOW BAKING  (Normal Maps + Diffuse Transfer)
 # ═══════════════════════════════════════════════════════════════════════════════
 # %%
 
-def step3_normal_maps(cfg: PipelineConfig) -> Dict[str, Path]:
-    """
-    STEP 3 — Generate Normal Maps from 2D concept images using
-    Stable-X/StableNormal.
-    Only processes models_3d entries that have normal_map=true.
-    Returns: dict[asset_name -> path_to_normal_png]
-    """
-    log_step_banner(3, "Normal Map Generation — StableNormal")
-    normal_maps: Dict[str, Path] = {}
+# ─────────────────────────────────────────────────────────────────────────────
+# Baking helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
-    # Filter to only models that need normal maps
-    need_normals = {k: v for k, v in cfg.models_3d.items() if v.normal_map}
-    if not need_normals:
-        LOG.info("ℹ️ No models require normal maps — skipping STEP 3.")
+def _estimate_normal_from_image(image: "Image.Image", pipe: Any) -> "np.ndarray | None":
+    """
+    Run a normal-estimation AI model (StableNormal / Marigold) on a 2D image.
+    Returns an HxWx3 float32 numpy array in [-1,1] range, or None on failure.
+    """
+    normal_out = pipe(image)
+
+    if isinstance(normal_out, dict):
+        normal_out = normal_out.get("normal_map", normal_out.get("images", [None])[0])
+    if hasattr(normal_out, "images"):
+        normal_out = normal_out.images[0]
+    if hasattr(normal_out, "prediction"):   # Marigold-style
+        normal_out = normal_out.prediction[0]
+
+    if isinstance(normal_out, Image.Image):
+        arr = np.array(normal_out, dtype=np.float32) / 255.0
+    elif isinstance(normal_out, np.ndarray):
+        arr = normal_out.astype(np.float32)
+        if arr.max() > 1.5:  # 0-255 range
+            arr = arr / 255.0
+    else:
+        return None
+
+    # Convert [0,1] → [-1,1] if needed (most normal maps encode as (n+1)/2)
+    if arr.min() >= 0:
+        arr = arr * 2.0 - 1.0
+    return arr
+
+
+def _build_bvh(highpoly_path: Path):
+    """
+    Load the high-poly mesh and build a proximity query structure.
+    Returns (trimesh.Trimesh, trimesh.proximity.ProximityQuery).
+    """
+    import trimesh
+    hp = trimesh.load(str(highpoly_path), force="mesh", process=False)
+    return hp, trimesh.proximity.ProximityQuery(hp)
+
+
+def _bake_geometric_normals(
+    highpoly_path: Path,
+    lowpoly_path: Path,
+    bake_resolution: int = 2048,
+) -> "np.ndarray":
+    """
+    Standard high-to-low geometric normal bake.
+
+    For every texel in the low-poly UV space:
+      1. Find the 3D surface point + tangent frame on the low-poly mesh.
+      2. Cast a ray along the low-poly surface normal to find the closest
+         high-poly surface point.
+      3. The high-poly surface normal at that hit point, expressed in the
+         low-poly tangent space, becomes the baked tangent-space normal.
+
+    Returns an (R, R, 3) float32 array in [-1, 1].
+    """
+    import trimesh
+
+    neutral = np.zeros((bake_resolution, bake_resolution, 3), dtype=np.float32)
+    neutral[..., 2] = 1.0  # (0,0,1) = flat tangent-space normal
+
+    lp = trimesh.load(str(lowpoly_path), force="mesh", process=False)
+    if not hasattr(lp.visual, "uv") or lp.visual.uv is None or len(lp.visual.uv) == 0:
+        LOG.warning("    ⚠️ Low-poly has no UVs — cannot bake geometric normals.")
+        return neutral
+
+    hp, hp_prox = _build_bvh(highpoly_path)
+
+    lp_verts = np.array(lp.vertices, dtype=np.float64)
+    lp_faces = np.array(lp.faces, dtype=np.int32)
+    lp_uvs = np.array(lp.visual.uv, dtype=np.float32)
+
+    # Pre-compute per-vertex normals on LOW-poly for tangent frame
+    if lp.vertex_normals is None or len(lp.vertex_normals) == 0:
+        lp.fix_normals()
+    lp_vnormals = np.array(lp.vertex_normals, dtype=np.float64)
+
+    # Pre-compute per-face normals on HIGH-poly
+    if hp.face_normals is None or len(hp.face_normals) == 0:
+        hp.fix_normals()
+
+    bake = neutral.copy()
+
+    for fi, face in enumerate(lp_faces):
+        uv_tri = lp_uvs[face]          # (3, 2)
+        v_tri = lp_verts[face]          # (3, 3)
+        n_tri = lp_vnormals[face]       # (3, 3)
+
+        # UV → pixel coords
+        px = (uv_tri[:, 0] * (bake_resolution - 1)).astype(np.int32)
+        py = ((1.0 - uv_tri[:, 1]) * (bake_resolution - 1)).astype(np.int32)
+
+        min_x = max(int(px.min()), 0)
+        max_x = min(int(px.max()), bake_resolution - 1)
+        min_y = max(int(py.min()), 0)
+        max_y = min(int(py.max()), bake_resolution - 1)
+        if min_x > max_x or min_y > max_y:
+            continue
+
+        # Barycentric setup
+        e0 = np.array([px[1] - px[0], py[1] - py[0]], dtype=np.float64)
+        e1 = np.array([px[2] - px[0], py[2] - py[0]], dtype=np.float64)
+        denom = e0[0] * e1[1] - e1[0] * e0[1]
+        if abs(denom) < 1e-10:
+            continue
+        inv_d = 1.0 / denom
+
+        for by in range(min_y, max_y + 1):
+            for bx in range(min_x, max_x + 1):
+                d = np.array([bx - px[0], by - py[0]], dtype=np.float64)
+                u = (d[0] * e1[1] - e1[0] * d[1]) * inv_d
+                v = (e0[0] * d[1] - d[0] * e0[1]) * inv_d
+                w = 1.0 - u - v
+                if u < -1e-4 or v < -1e-4 or w < -1e-4:
+                    continue
+
+                # Interpolated 3D position and normal on low-poly
+                pos_lp = w * v_tri[0] + u * v_tri[1] + v * v_tri[2]
+                nrm_lp = w * n_tri[0] + u * n_tri[1] + v * n_tri[2]
+                nrm_lp /= (np.linalg.norm(nrm_lp) + 1e-12)
+
+                # Find closest point on high-poly
+                closest, dist, tri_id = hp_prox.on_surface([pos_lp])
+                hp_normal = hp.face_normals[tri_id[0]].astype(np.float64)
+                hp_normal /= (np.linalg.norm(hp_normal) + 1e-12)
+
+                # Build tangent frame from low-poly normal
+                N = nrm_lp
+                # Choose a non-parallel vector for cross product
+                up = np.array([0, 1, 0], dtype=np.float64)
+                if abs(np.dot(N, up)) > 0.99:
+                    up = np.array([1, 0, 0], dtype=np.float64)
+                T = np.cross(N, up)
+                T /= (np.linalg.norm(T) + 1e-12)
+                B = np.cross(N, T)
+                B /= (np.linalg.norm(B) + 1e-12)
+
+                # Express high-poly normal in tangent space
+                ts_x = np.dot(hp_normal, T)
+                ts_y = np.dot(hp_normal, B)
+                ts_z = np.dot(hp_normal, N)
+                bake[by, bx] = [ts_x, ts_y, ts_z]
+
+    return bake
+
+
+def _bake_diffuse_transfer(
+    highpoly_path: Path,
+    highpoly_texture_path: Path,
+    lowpoly_path: Path,
+    bake_resolution: int = 2048,
+) -> "np.ndarray":
+    """
+    Transfer the high-poly colour texture onto the low-poly UV layout.
+
+    For each texel in low-poly UV space:
+      1. Compute 3D surface point.
+      2. Find nearest point on high-poly.
+      3. Convert that point to high-poly UV, sample colour.
+      4. Write into low-poly bake.
+
+    Returns an (R, R, 3) uint8 diffuse map.
+    """
+    import trimesh
+
+    bake = np.full((bake_resolution, bake_resolution, 3), 128, dtype=np.uint8)
+
+    lp = trimesh.load(str(lowpoly_path), force="mesh", process=False)
+    if not hasattr(lp.visual, "uv") or lp.visual.uv is None:
+        LOG.warning("    ⚠️ Low-poly has no UVs — cannot transfer diffuse.")
+        return bake
+
+    hp = trimesh.load(str(highpoly_path), force="mesh", process=False)
+    hp_prox = trimesh.proximity.ProximityQuery(hp)
+
+    tex_img = np.array(Image.open(highpoly_texture_path).convert("RGB"))
+    tex_h, tex_w = tex_img.shape[:2]
+
+    # Check if high-poly has UVs for proper sampling
+    hp_has_uv = (hasattr(hp.visual, "uv") and hp.visual.uv is not None
+                 and len(hp.visual.uv) > 0)
+
+    lp_verts = np.array(lp.vertices, dtype=np.float64)
+    lp_faces = np.array(lp.faces, dtype=np.int32)
+    lp_uvs = np.array(lp.visual.uv, dtype=np.float32)
+
+    if hp_has_uv:
+        hp_uvs = np.array(hp.visual.uv, dtype=np.float32)
+        hp_faces = np.array(hp.faces, dtype=np.int32)
+        hp_verts = np.array(hp.vertices, dtype=np.float64)
+
+    for face in lp_faces:
+        uv_tri = lp_uvs[face]
+        v_tri = lp_verts[face]
+
+        px = (uv_tri[:, 0] * (bake_resolution - 1)).astype(np.int32)
+        py = ((1.0 - uv_tri[:, 1]) * (bake_resolution - 1)).astype(np.int32)
+
+        min_x = max(int(px.min()), 0)
+        max_x = min(int(px.max()), bake_resolution - 1)
+        min_y = max(int(py.min()), 0)
+        max_y = min(int(py.max()), bake_resolution - 1)
+        if min_x > max_x or min_y > max_y:
+            continue
+
+        e0 = np.array([px[1] - px[0], py[1] - py[0]], dtype=np.float64)
+        e1 = np.array([px[2] - px[0], py[2] - py[0]], dtype=np.float64)
+        denom = e0[0] * e1[1] - e1[0] * e0[1]
+        if abs(denom) < 1e-10:
+            continue
+        inv_d = 1.0 / denom
+
+        for by in range(min_y, max_y + 1):
+            for bx in range(min_x, max_x + 1):
+                d = np.array([bx - px[0], by - py[0]], dtype=np.float64)
+                u = (d[0] * e1[1] - e1[0] * d[1]) * inv_d
+                v = (e0[0] * d[1] - d[0] * e0[1]) * inv_d
+                w = 1.0 - u - v
+                if u < -1e-4 or v < -1e-4 or w < -1e-4:
+                    continue
+
+                pos_lp = w * v_tri[0] + u * v_tri[1] + v * v_tri[2]
+
+                # Closest point on high-poly
+                closest, dist, tri_id = hp_prox.on_surface([pos_lp])
+
+                if hp_has_uv:
+                    # Compute barycentric on high-poly triangle to sample UV
+                    hp_face = hp_faces[tri_id[0]]
+                    hp_v = hp_verts[hp_face]
+                    # Barycentric of closest point in HP triangle
+                    hit = closest[0]
+                    e0h = hp_v[1] - hp_v[0]
+                    e1h = hp_v[2] - hp_v[0]
+                    dh = hit - hp_v[0]
+                    d00 = np.dot(e0h, e0h)
+                    d01 = np.dot(e0h, e1h)
+                    d11 = np.dot(e1h, e1h)
+                    d20 = np.dot(dh, e0h)
+                    d21 = np.dot(dh, e1h)
+                    denom_h = d00 * d11 - d01 * d01
+                    if abs(denom_h) < 1e-12:
+                        continue
+                    bv = (d11 * d20 - d01 * d21) / denom_h
+                    bw = (d00 * d21 - d01 * d20) / denom_h
+                    bu = 1.0 - bv - bw
+                    hp_uv = bu * hp_uvs[hp_face[0]] + bv * hp_uvs[hp_face[1]] + bw * hp_uvs[hp_face[2]]
+                    sx = int(np.clip(hp_uv[0], 0, 1) * (tex_w - 1))
+                    sy = int((1.0 - np.clip(hp_uv[1], 0, 1)) * (tex_h - 1))
+                else:
+                    # No HP UVs — orthographic projection fallback
+                    c = closest[0]
+                    bbox_min = hp.vertices.min(axis=0)
+                    bbox_max = hp.vertices.max(axis=0)
+                    extent = bbox_max - bbox_min
+                    extent[extent < 1e-8] = 1.0
+                    nrm_pt = (c - bbox_min) / extent  # [0,1]
+                    sx = int(np.clip(nrm_pt[0], 0, 1) * (tex_w - 1))
+                    sy = int((1.0 - np.clip(nrm_pt[1], 0, 1)) * (tex_h - 1))
+
+                bake[by, bx] = tex_img[sy, sx]
+
+    return bake
+
+
+def _combine_normal_maps(
+    geo_normals: "np.ndarray",
+    ai_normals: "np.ndarray",
+    strength: float = 1.0,
+) -> "np.ndarray":
+    """
+    Combine two tangent-space normal maps using the Reoriented Normal Mapping
+    (RNM) technique — the industry standard for overlaying detail normals.
+
+    Both inputs are float32 in [-1, 1] range, shape (H, W, 3).
+    Returns float32 in [-1, 1].
+    """
+    # Resize ai_normals to match geo_normals if needed
+    if ai_normals.shape[:2] != geo_normals.shape[:2]:
+        from PIL import Image as _Img
+        h, w = geo_normals.shape[:2]
+        ai_img = _Img.fromarray(((ai_normals * 0.5 + 0.5) * 255).clip(0, 255).astype(np.uint8))
+        ai_img = ai_img.resize((w, h), _Img.LANCZOS)
+        ai_normals = np.array(ai_img, dtype=np.float32) / 255.0 * 2.0 - 1.0
+
+    # Apply strength to the detail (AI) map
+    detail = ai_normals.copy()
+    detail[..., :2] *= strength
+
+    # Reoriented Normal Mapping (RNM)
+    # t = base * float3( 1, 1, 1) + float3(0, 0, 1)
+    # u = detail * float3(-1,-1, 1) + float3(0, 0, 1)
+    # result = normalize(t * dot(t, u) - u * t.z)
+    t = geo_normals.copy()
+    t[..., 2] += 1.0
+    u = detail.copy()
+    u[..., 0] *= -1.0
+    u[..., 1] *= -1.0
+    u[..., 2] += 1.0
+
+    dot_tu = np.sum(t * u, axis=-1, keepdims=True)
+    result = t * dot_tu - u * t[..., 2:3]
+
+    # Normalize
+    length = np.linalg.norm(result, axis=-1, keepdims=True)
+    length = np.maximum(length, 1e-8)
+    result = result / length
+
+    return result.astype(np.float32)
+
+
+def _normal_float_to_uint8(normal_f32: "np.ndarray") -> "np.ndarray":
+    """Convert [-1,1] float32 tangent-space normal to [0,255] uint8."""
+    return ((normal_f32 * 0.5 + 0.5) * 255).clip(0, 255).astype(np.uint8)
+
+
+def step3_bake_textures(
+    cfg: PipelineConfig,
+    retopo_results: Dict[str, dict],
+) -> Dict[str, dict]:
+    """
+    STEP 3 — Full High-to-Low Baking Pipeline.
+
+    For each asset that has normal_map=true:
+
+      A) AI Normal from High-Poly Texture:
+         - Feed the TRELLIS high-poly colour texture (or concept image fallback)
+           into StableNormal / Marigold → produces "AI normal map".
+
+      B) Geometric Normal Bake (High→Low):
+         - For every texel in the low-poly UV, ray-cast to the high-poly mesh.
+         - Express the high-poly surface normal in the low-poly tangent frame
+           → produces "geometric difference normal map".
+
+      C) Normal Combine:
+         - Merge (A) and (B) using Reoriented Normal Mapping (RNM).
+         - This gives a final normal map with BOTH the high-poly surface detail
+           AND the AI-inferred micro-detail.
+
+      D) Diffuse Transfer (bonus — if high-poly texture available):
+         - Project the high-poly colour onto the low-poly UV → diffuse map.
+
+    Returns: dict[asset_name -> {
+        "normal":  Path,          # final combined normal map
+        "diffuse": Path | None,   # transferred diffuse / albedo
+    }]
+    """
+    log_step_banner(3, "High→Low Bake  (Normals + Diffuse)")
+    bake_outputs: Dict[str, dict] = {}
+
+    need_bake = {
+        k: v for k, v in cfg.models_3d.items()
+        if v.normal_map and k in retopo_results
+    }
+    if not need_bake:
+        LOG.info("ℹ️ No models require baking — skipping STEP 3.")
         log_step_done(3)
-        return normal_maps
+        return bake_outputs
+
+    # ── Load the AI normal estimation model ──────────────────────────────────
+    pipe = None
+    pipeline_name = "none"
 
     try:
         from stable_normal.pipeline import StableNormalPipeline
-
         LOG.info("Loading StableNormal model (FP16) …")
         pipe = StableNormalPipeline.from_pretrained(
             "Stable-X/StableNormal",
             torch_dtype=DTYPE_FP16,
-        )
-        pipe = pipe.to(DEVICE)
+        ).to(DEVICE)
+        pipeline_name = "StableNormal"
         LOG.info("StableNormal loaded on %s (FP16)", DEVICE)
-
-        for asset_name, model_cfg in tqdm(need_normals.items(), desc="Normal Maps"):
-            img_path = model_cfg.concept_img
-            if not img_path.exists():
-                LOG.warning("⚠️ Image not found for %s, skipping normal map.", asset_name)
-                continue
-
-            image = Image.open(img_path).convert("RGB")
-
-            # Resize to a sensible resolution for normal estimation
-            max_dim = 1024
-            w, h = image.size
-            if max(w, h) > max_dim:
-                scale = max_dim / max(w, h)
-                image = image.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
-
-            # Run the pipeline
-            normal_image = pipe(image)
-
-            # The output is typically a PIL Image or a dict with "normal_map"
-            if isinstance(normal_image, dict):
-                normal_image = normal_image.get("normal_map", normal_image.get("images", [None])[0])
-            if hasattr(normal_image, "images"):
-                normal_image = normal_image.images[0]
-
-            out_path = OUTPUT_TEX / f"{asset_name}_normal.png"
-            if isinstance(normal_image, Image.Image):
-                normal_image.save(str(out_path))
-            elif isinstance(normal_image, np.ndarray):
-                Image.fromarray(normal_image).save(str(out_path))
-            else:
-                LOG.warning("⚠️ Unexpected normal output type: %s", type(normal_image))
-                continue
-
-            normal_maps[asset_name] = out_path
-            LOG.info("  ✔ Normal map → %s", out_path.name)
-
-        del pipe
-        purge_vram()
-
     except ImportError:
-        LOG.warning(
-            "⚠️ StableNormal not available. Attempting fallback with diffusers marigold …"
-        )
+        LOG.warning("⚠️ StableNormal not available, trying Marigold fallback …")
         try:
             from diffusers import MarigoldNormalsPipeline
-
             LOG.info("Loading Marigold Normals (FP16) …")
             pipe = MarigoldNormalsPipeline.from_pretrained(
                 "prs-eth/marigold-normals-lcm-v0-1",
                 torch_dtype=DTYPE_FP16,
                 variant="fp16",
-            )
-            pipe = pipe.to(DEVICE)
-
-            for asset_name, model_cfg in need_normals.items():
-                img_path = model_cfg.concept_img
-                if not img_path.exists():
-                    continue
-                image = Image.open(img_path).convert("RGB")
-                output = pipe(image, num_inference_steps=4)
-                normal_img = output.prediction[0]
-                out_path = OUTPUT_TEX / f"{asset_name}_normal.png"
-                pipe.image_processor.save_visualization(normal_img, str(out_path))
-                normal_maps[asset_name] = out_path
-                LOG.info("  ✔ [Marigold] Normal map → %s", out_path.name)
-
-            del pipe
-            purge_vram()
-
+            ).to(DEVICE)
+            pipeline_name = "Marigold"
         except Exception as e2:
-            LOG.error("❌ Fallback normal map generation also failed: %s", e2)
-            try:
-                del pipe
-            except NameError:
-                pass
-            purge_vram()
+            LOG.error("❌ Neither StableNormal nor Marigold available: %s", e2)
+            log_step_done(3)
+            return bake_outputs
+
+    if pipe is None:
+        log_step_done(3)
+        return bake_outputs
+
+    # ── Process each asset ───────────────────────────────────────────────────
+    BAKE_RES = 2048
+
+    try:
+        for asset_name, model_cfg in tqdm(need_bake.items(), desc="Baking"):
+            r = retopo_results[asset_name]
+            lowpoly_path: Path = r["lowpoly"]
+            highpoly_path: Path = r["highpoly"]
+            hp_texture_path: Path | None = r.get("texture_highpoly")
+
+            if not lowpoly_path.exists():
+                LOG.warning("⚠️ Low-poly mesh missing for %s, skipping.", asset_name)
+                continue
+
+            # ── (A) AI Normal from High-Poly Texture ─────────────────────────
+            # Prefer the high-poly colour texture; fall back to concept image
+            if hp_texture_path and hp_texture_path.exists():
+                source_img = Image.open(hp_texture_path).convert("RGB")
+                LOG.info("  [%s] AI normal from high-poly texture for %s",
+                         pipeline_name, asset_name)
+            else:
+                source_img = Image.open(model_cfg.concept_img).convert("RGB")
+                LOG.info("  [%s] AI normal from concept image (no HP texture) for %s",
+                         pipeline_name, asset_name)
+
+            # Clamp resolution for AI model
+            max_dim = 1024
+            w, h = source_img.size
+            if max(w, h) > max_dim:
+                sc = max_dim / max(w, h)
+                source_img = source_img.resize(
+                    (int(w * sc), int(h * sc)), Image.LANCZOS
+                )
+
+            ai_normal = _estimate_normal_from_image(source_img, pipe)
+            if ai_normal is None:
+                LOG.warning("⚠️ AI normal estimation failed for %s", asset_name)
+                ai_normal = np.zeros((BAKE_RES, BAKE_RES, 3), dtype=np.float32)
+                ai_normal[..., 2] = 1.0  # flat fallback
+
+            # Save AI normal as reference
+            ai_ref_path = OUTPUT_TEX / f"{asset_name}_normal_ai.png"
+            Image.fromarray(_normal_float_to_uint8(ai_normal)).save(str(ai_ref_path))
+            LOG.info("  ✔ AI normal map saved → %s", ai_ref_path.name)
+
+            # ── (B) Geometric Normal Bake (High→Low) ─────────────────────────
+            if highpoly_path.exists() and highpoly_path != lowpoly_path:
+                LOG.info("  Baking geometric normals (high→low) for %s …", asset_name)
+                geo_normals = _bake_geometric_normals(
+                    highpoly_path, lowpoly_path, BAKE_RES
+                )
+            else:
+                LOG.info("  High-poly == low-poly for %s — using flat geometric base.",
+                         asset_name)
+                geo_normals = np.zeros((BAKE_RES, BAKE_RES, 3), dtype=np.float32)
+                geo_normals[..., 2] = 1.0
+
+            geo_ref_path = OUTPUT_TEX / f"{asset_name}_normal_geo.png"
+            Image.fromarray(_normal_float_to_uint8(geo_normals)).save(str(geo_ref_path))
+            LOG.info("  ✔ Geometric normal map saved → %s", geo_ref_path.name)
+
+            # ── (C) Normal Combine ───────────────────────────────────────────
+            LOG.info("  Combining geometric + AI normals (RNM) for %s …", asset_name)
+            combined = _combine_normal_maps(geo_normals, ai_normal, strength=1.0)
+            out_normal = OUTPUT_TEX / f"{asset_name}_normal.png"
+            Image.fromarray(_normal_float_to_uint8(combined)).save(str(out_normal))
+            LOG.info("  ✔ Final combined normal map → %s (%dx%d)",
+                     out_normal.name, BAKE_RES, BAKE_RES)
+
+            # ── (D) Diffuse Transfer ─────────────────────────────────────────
+            out_diffuse: Path | None = None
+            if hp_texture_path and hp_texture_path.exists() and highpoly_path.exists():
+                LOG.info("  Transferring diffuse colour (high→low) for %s …", asset_name)
+                diffuse = _bake_diffuse_transfer(
+                    highpoly_path, hp_texture_path, lowpoly_path, BAKE_RES
+                )
+                out_diffuse = OUTPUT_TEX / f"{asset_name}_diffuse.png"
+                Image.fromarray(diffuse).save(str(out_diffuse))
+                LOG.info("  ✔ Diffuse map → %s", out_diffuse.name)
+
+            bake_outputs[asset_name] = {
+                "normal": out_normal,
+                "diffuse": out_diffuse,
+            }
+
+        del pipe
+        purge_vram()
 
     except Exception as e:
-        LOG.error("❌ StableNormal step failed: %s", e, exc_info=True)
+        LOG.error("❌ Baking step failed: %s", e, exc_info=True)
         try:
             del pipe
         except NameError:
@@ -713,7 +1242,7 @@ def step3_normal_maps(cfg: PipelineConfig) -> Dict[str, Path]:
         purge_vram()
 
     log_step_done(3)
-    return normal_maps
+    return bake_outputs
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1315,17 +1844,29 @@ def run_pipeline(zip_path: str | Path) -> dict:
 
     results = {}
 
-    # ── STEP 1: TRELLIS 3D ──────────────────────────────────────────────────
-    raw_meshes = step1_trellis_3d(cfg)
-    results["raw_meshes"] = {k: str(v) for k, v in raw_meshes.items()}
+    # ── STEP 1: TRELLIS 3D (high-poly mesh + texture) ────────────────────────
+    trellis_out = step1_trellis_3d(cfg)
+    results["trellis"] = {
+        k: {"mesh": str(v["mesh"]), "texture": str(v["texture"]) if v["texture"] else None}
+        for k, v in trellis_out.items()
+    }
 
-    # ── STEP 2: Instant Meshes Retopology ────────────────────────────────────
-    retopo_meshes = step2_retopology(raw_meshes, cfg)
-    results["retopo_meshes"] = {k: str(v) for k, v in retopo_meshes.items()}
+    # ── STEP 2: Instant Meshes Retopology + UV Unwrap (low-poly) ─────────────
+    retopo_results = step2_retopology(trellis_out, cfg)
+    results["retopo"] = {
+        k: {"lowpoly": str(v["lowpoly"]), "highpoly": str(v["highpoly"])}
+        for k, v in retopo_results.items()
+    }
 
-    # ── STEP 3: StableNormal Normal Maps ─────────────────────────────────────
-    normal_maps = step3_normal_maps(cfg)
-    results["normal_maps"] = {k: str(v) for k, v in normal_maps.items()}
+    # ── STEP 3: High→Low Bake (Normals + Diffuse) ────────────────────────────
+    bake_outputs = step3_bake_textures(cfg, retopo_results)
+    results["bake"] = {
+        k: {"normal": str(v["normal"]), "diffuse": str(v["diffuse"]) if v["diffuse"] else None}
+        for k, v in bake_outputs.items()
+    }
+
+    # Convenience: extract lowpoly mesh dict for downstream steps
+    retopo_meshes = {k: v["lowpoly"] for k, v in retopo_results.items()}
 
     # ── STEP 4: RigNet Auto-Rigging ──────────────────────────────────────────
     rigged = step4_rigging(retopo_meshes, cfg)
