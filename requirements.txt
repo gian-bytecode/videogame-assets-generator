@@ -23,8 +23,8 @@ huggingface_hub
 # kaolin necessita di installazione separata con il flag -f:
 #   pip install kaolin -f https://nvidia-kaolin.s3.us-east-2.amazonaws.com/torch-2.1.0_cu121.html
 
-# nvdiffrast va installato da git:
-#   pip install git+https://github.com/NVlabs/nvdiffrast.git
+# nvdiffrast viene installato automaticamente da TRELLIS
+# (richiede build C++/CUDA, non è su PyPI)
 
 xatlas
 plyfile

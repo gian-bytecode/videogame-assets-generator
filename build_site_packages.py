@@ -50,7 +50,7 @@ PACKAGES: list[dict] = [
     {"name": "huggingface_hub",     "pip": "huggingface_hub"},
     # ── 2. TRELLIS deps ──
     {"name": "kaolin",              "pip": "kaolin",              "extra": "-f https://nvidia-kaolin.s3.us-east-2.amazonaws.com/torch-2.1.0_cu121.html"},
-    {"name": "nvdiffrast",          "pip": "git+https://github.com/NVlabs/nvdiffrast.git"},
+    # nvdiffrast viene installato automaticamente da TRELLIS (richiede build C++/CUDA)
     {"name": "xatlas",              "pip": "xatlas"},
     {"name": "plyfile",             "pip": "plyfile"},
     {"name": "imageio",             "pip": "imageio"},
