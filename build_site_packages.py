@@ -22,14 +22,17 @@ VPS_URL = "wss://YOUR_VPS_IP_OR_DOMAIN:9999"
 if "YOUR_VPS_IP_OR_DOMAIN" in VPS_URL:
     VPS_URL=f"wss://{input('Enter VPS IP or domain: ')}:9999"
 
-# Local install target (Colab ephemeral disk — NOT Drive)
-TARGET_DIR = "/content/site_packages"
+# Local workspace root (must match colab_bootstrap.py)
+WORKSPACE = "/content/videogame-assets-generator"
+
+# Local install target (inside workspace, same path colab_bootstrap expects)
+TARGET_DIR = f"{WORKSPACE}/site_packages"
 
 # Upload path prefix on the VPS (relative to file_root in config.yaml)
 REMOTE_PREFIX = "site_packages"
 
 # Chunk size for uploads (must match server's max_message_size)
-UPLOAD_CHUNK = 1 * 1024 * 1024  # 2 MiB
+UPLOAD_CHUNK = 1 * 1024 * 1024  # 1 MiB
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # PACKAGE LIST — Each entry = one pip install + upload cycle
@@ -205,7 +208,10 @@ class VPSUploadClient:
             ssl_context=ssl_ctx,
             max_size=50 * 1024 * 1024,
             open_timeout=30,
-            close_timeout=10,
+            close_timeout=30,
+            # Keep connection alive during long server-side operations
+            ping_interval=20,
+            ping_timeout=120,
         )
         # Auth
         self.ws.send(json.dumps({"action": "auth", "password": self.password}))
